@@ -193,18 +193,21 @@ func accSub(purpose string) string {
 	return fmt.Sprintf("tf-acc-%s-%d", purpose, time.Now().UnixNano())
 }
 
-// testAccCleanupSource registers a t.Cleanup that disables and renames a
-// source the test created to "zzz-delete-me <current name>", so the immortal
-// leftover is harmless and identifiable in the dashboard. The PATCH is sparse
-// (enabled + name only), so nothing else is touched, and the deploy it
-// triggers is fire-and-forget. A failed cleanup logs a warning but never
-// fails the test.
+// testAccCleanupSource registers a t.Cleanup that disables and renames the
+// source carrying the test's unique subdomain to "zzz-delete-me <current
+// name>", so the immortal leftover is harmless and identifiable in the
+// dashboard. Register it before the source is created: the source ID is
+// resolved by subdomain lookup at cleanup time, so cleanup still lands when
+// an apply created the source but failed before returning its ID. No source
+// matching the subdomain means the create never committed — a graceful no-op.
 //
-// The source is re-read before PATCHing (one GET; reads are not subject to
-// the ~60/hour create/update rate limit) and the PATCH is skipped unless the
-// source still carries the test's own tf-acc subdomain, so cleanup can never
-// touch anything the test did not create.
-func testAccCleanupSource(t *testing.T, client *imgix.Client, sourceID, subdomain string) {
+// The PATCH is sparse (enabled + name only), so nothing else is touched, and
+// the deploy it triggers is fire-and-forget. A failed cleanup logs a warning
+// but never fails the test. Lookups are GETs, which are not subject to the
+// ~60/hour create/update rate limit, and FindSourceBySubdomains requires an
+// exact subdomain-set match on the test's own tf-acc subdomain, so cleanup
+// can never touch anything the test did not create.
+func testAccCleanupSource(t *testing.T, client *imgix.Client, subdomain string) {
 	t.Helper()
 	if !strings.HasPrefix(subdomain, "tf-acc-") {
 		// Never let cleanup touch anything but disposable sources.
@@ -214,17 +217,13 @@ func testAccCleanupSource(t *testing.T, client *imgix.Client, sourceID, subdomai
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		src, err := client.GetSource(ctx, sourceID)
-		if imgix.NotFound(err) {
-			t.Logf("cleanup: source %s is already gone", sourceID)
-			return
-		}
+		src, err := client.FindSourceBySubdomains(ctx, []string{subdomain})
 		if err != nil {
-			t.Logf("cleanup: WARNING: reading source %s failed, leaving it untouched: %v", sourceID, err)
+			t.Logf("cleanup: WARNING: looking up source by subdomain %s failed, leaving it untouched: %v", subdomain, err)
 			return
 		}
-		if src.Deployment == nil || !containsString(src.Deployment.ImgixSubdomains, subdomain) {
-			t.Logf("cleanup: WARNING: source %s does not carry this test's subdomain %s, refusing to touch it", sourceID, subdomain)
+		if src == nil {
+			t.Logf("cleanup: no source carries subdomain %s (never created or already gone)", subdomain)
 			return
 		}
 
@@ -232,24 +231,19 @@ func testAccCleanupSource(t *testing.T, client *imgix.Client, sourceID, subdomai
 		if !strings.HasPrefix(name, "zzz-delete-me ") {
 			name = "zzz-delete-me " + name
 		}
-		if _, err := client.UpdateSource(ctx, sourceID, map[string]interface{}{
+		if src.Enabled != nil && !*src.Enabled && name == src.Name {
+			t.Logf("cleanup: source %s is already disabled and renamed", src.ID)
+			return
+		}
+		if _, err := client.UpdateSource(ctx, src.ID, map[string]interface{}{
 			"enabled": false,
 			"name":    name,
 		}); err != nil {
-			t.Logf("cleanup: WARNING: disabling/renaming source %s failed: %v", sourceID, err)
+			t.Logf("cleanup: WARNING: disabling/renaming source %s failed: %v", src.ID, err)
 			return
 		}
-		t.Logf("cleanup: source %s disabled and renamed to %q", sourceID, name)
+		t.Logf("cleanup: source %s disabled and renamed to %q", src.ID, name)
 	})
-}
-
-func containsString(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
 }
 
 func testAccConfig(subdomain, name, params string, withSecrets bool, withAnnotation bool) string {
@@ -295,6 +289,9 @@ resource "imgix_source" "test" {
 func TestAccSourceLifecycle(t *testing.T) {
 	subdomain := accSub("main")
 	w := newTFWorkdir(t, testAccConfig(subdomain, "TF acceptance "+subdomain, `{ auto = "compress,format" }`, true, true))
+	// Arm cleanup before apply: if apply creates the source but fails before
+	// returning its ID, the subdomain lookup still finds it.
+	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), subdomain)
 
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 
@@ -320,7 +317,6 @@ func TestAccSourceLifecycle(t *testing.T) {
 		t.Fatalf("domains must include %s.imgix.net: %v", subdomain, domains)
 	}
 	sourceID := values["id"].(string)
-	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), sourceID, subdomain)
 
 	w.expectEmptyPlan()
 
@@ -344,10 +340,10 @@ func TestAccSourceImportCleanPlan(t *testing.T) {
 	name := "TF import " + subdomain
 
 	w := newTFWorkdir(t, testAccConfig(subdomain, name, `{}`, true, true))
+	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), subdomain)
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values := w.stateValues()
 	sourceID := values["id"].(string)
-	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), sourceID, subdomain)
 
 	// Drop state, switch to a config without the origin secret, and import:
 	// the imported resource must plan cleanly without recovering the secret.
@@ -371,9 +367,9 @@ func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 
 	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true, true))
+	testAccCleanupSource(t, client, subdomain)
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	sourceID := w.stateValues()["id"].(string)
-	testAccCleanupSource(t, client, sourceID, subdomain)
 
 	modeled := map[string]bool{
 		"type": true, "imgix_subdomains": true, "gcs_bucket": true, "gcs_access_key": true,
@@ -422,6 +418,7 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 	ctx := context.Background()
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 	subdomain := accSub("probe")
+	testAccCleanupSource(t, client, subdomain)
 
 	source, err := client.CreateSource(ctx, map[string]interface{}{
 		"name": "TF delete probe " + subdomain,
@@ -436,7 +433,6 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	testAccCleanupSource(t, client, source.ID, subdomain)
 
 	err = client.DeleteSource(ctx, source.ID)
 	switch {
@@ -496,10 +492,10 @@ resource "imgix_source" "test" {
 
 	// Phase 1: create without a fallback image.
 	w := newTFWorkdir(t, configFor(""))
+	testAccCleanupSource(t, client, subdomain)
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values := w.stateValues()
 	sourceID := values["id"].(string)
-	testAccCleanupSource(t, client, sourceID, subdomain)
 	if got := getImageError(sourceID); got != nil {
 		t.Fatalf("image_error must be null without configuration, got %v", got)
 	}
@@ -548,6 +544,7 @@ func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 
 	// The pre-existing "victim": a disposable source owned by this test run.
 	victimSub := accSub("victim")
+	testAccCleanupSource(t, client, victimSub)
 	victim, err := client.CreateSource(ctx, map[string]interface{}{
 		"name": "TF conflict victim " + victimSub,
 		"deployment": map[string]interface{}{
@@ -561,7 +558,6 @@ func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating victim source: %v", err)
 	}
-	testAccCleanupSource(t, client, victim.ID, victimSub)
 
 	// Let the victim finish deploying before snapshotting, so the comparison
 	// is not confounded by the legitimate deployment_status transition.
