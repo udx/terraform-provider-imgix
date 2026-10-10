@@ -141,7 +141,7 @@ IMGIX_TEST_GCS_SECRET_KEY=... \
 go test ./internal/provider/ -timeout 20m
 ```
 
-Acceptance tests require a disposable GCS bucket and HMAC pair and create only `tf-acc-*` sources; they refuse to run against sources they did not create. Releases are cut from tags (`v*`) via GoReleaser with GPG-signed checksums, published to the Terraform Registry as `udx/imgix`.
+Acceptance tests require a disposable GCS bucket and HMAC pair and create only `tf-acc-*` sources; they refuse to run against sources they did not create. Sources cannot be deleted through the API, so each test disables and renames its own sources to `zzz-delete-me <name>` on the way out, leaving leftovers harmless and identifiable for periodic dashboard removal. Releases are cut from tags (`v*`) via GoReleaser with GPG-signed checksums, published to the Terraform Registry as `udx/imgix`.
 
 ## License
 
