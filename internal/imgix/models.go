@@ -249,9 +249,13 @@ func (c *Client) WaitForStatus(ctx context.Context, id string, wantDisabled bool
 		interval = 5 * time.Second
 	}
 	var lastStatus string
+	var lastErr error
 	for {
 		src, err := c.GetSource(ctx, id)
-		if err != nil && !NotFound(err) {
+		if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			// The caller's deadline fired mid-poll; preserve the last real
+			// status — the sleep below returns the context error.
+		} else if err != nil && !NotFound(err) {
 			var apiErr *Error
 			if errors.As(err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
 				// Permanent auth failure: fail fast instead of timing out.
@@ -260,8 +264,10 @@ func (c *Client) WaitForStatus(ctx context.Context, id string, wantDisabled bool
 			// Read-after-write lag and transient errors: keep polling until the
 			// caller's context deadline.
 			lastStatus = "unreadable"
+			lastErr = err
 		} else if src != nil {
 			lastStatus = src.DeploymentStatus
+			lastErr = nil
 			switch {
 			case wantDisabled && src.DeploymentStatus == "disabled":
 				return src, nil
@@ -273,6 +279,9 @@ func (c *Client) WaitForStatus(ctx context.Context, id string, wantDisabled bool
 		}
 
 		if err := sleep(ctx, interval); err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("timed out waiting for source %s to reach %q (last status %q, last read error: %v): %w", id, wantedStatus(wantDisabled), lastStatus, lastErr, err)
+			}
 			return nil, fmt.Errorf("timed out waiting for source %s to reach %q (last status %q): %w", id, wantedStatus(wantDisabled), lastStatus, err)
 		}
 	}
