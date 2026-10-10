@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/udx/terraform-provider-imgix/internal/imgix"
 )
@@ -19,8 +19,10 @@ import (
 // binary (dev_overrides). resource.Test is deliberately not used: the Imgix
 // API cannot delete sources (verified by TestAccSourceDeletionProbe), so the
 // harness' post-test destroy would always fail. These tests assert the
-// destroy error explicitly and clean state with `tofu state rm`; the
-// disposable tf-acc-* sources they create are logged for dashboard cleanup.
+// destroy error explicitly and clean state with `tofu state rm`. The sources
+// themselves are immortal, so every source a test creates is disabled and
+// renamed to "zzz-delete-me <name>" by testAccCleanupSource, leaving
+// leftovers harmless and identifiable for periodic dashboard removal.
 //
 // Required env: IMGIX_API_KEY, IMGIX_TEST_GCS_BUCKET,
 // IMGIX_TEST_GCS_ACCESS_KEY, IMGIX_TEST_GCS_SECRET_KEY (a disposable bucket
@@ -169,8 +171,8 @@ func (w *tfWorkdir) expectEmptyPlan() {
 
 // expectDestroyFails asserts the documented destroy behavior: the API cannot
 // delete sources, so destroy must fail clearly. State is then dropped with
-// `tofu state rm` (the only sanctioned way to stop managing a source), and
-// the source ID is logged for dashboard cleanup.
+// `tofu state rm` (the only sanctioned way to stop managing a source). The
+// leftover source itself is neutralized by testAccCleanupSource.
 func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 	w.t.Helper()
 	out, err := w.run("destroy", "-no-color", "-auto-approve")
@@ -181,7 +183,7 @@ func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 		w.t.Fatalf("destroy failed for an unexpected reason:\n%s", out)
 	}
 	w.mustRun("state", "rm", "imgix_source.test")
-	w.t.Logf("tf-acc source %s left in the Imgix account (API cannot delete) — remove in the dashboard", sourceID)
+	w.t.Logf("state dropped for source %s (the API cannot delete sources)", sourceID)
 }
 
 // accSub returns a unique disposable subdomain for acceptance tests. Leftover
@@ -189,6 +191,65 @@ func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 // across runs (PID-based suffixes collide; nanosecond timestamps do not).
 func accSub(purpose string) string {
 	return fmt.Sprintf("tf-acc-%s-%d", purpose, time.Now().UnixNano())
+}
+
+// testAccCleanupSource registers a t.Cleanup that disables and renames a
+// source the test created to "zzz-delete-me <current name>", so the immortal
+// leftover is harmless and identifiable in the dashboard. The PATCH is sparse
+// (enabled + name only), so nothing else is touched, and the deploy it
+// triggers is fire-and-forget. A failed cleanup logs a warning but never
+// fails the test.
+//
+// The source is re-read before PATCHing (one GET; reads are not subject to
+// the ~60/hour create/update rate limit) and the PATCH is skipped unless the
+// source still carries the test's own tf-acc subdomain, so cleanup can never
+// touch anything the test did not create.
+func testAccCleanupSource(t *testing.T, client *imgix.Client, sourceID, subdomain string) {
+	t.Helper()
+	if !strings.HasPrefix(subdomain, "tf-acc-") {
+		// Never let cleanup touch anything but disposable sources.
+		panic(fmt.Sprintf("cleanup subdomain %q must start with tf-acc-", subdomain))
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		src, err := client.GetSource(ctx, sourceID)
+		if imgix.NotFound(err) {
+			t.Logf("cleanup: source %s is already gone", sourceID)
+			return
+		}
+		if err != nil {
+			t.Logf("cleanup: WARNING: reading source %s failed, leaving it untouched: %v", sourceID, err)
+			return
+		}
+		if src.Deployment == nil || !containsString(src.Deployment.ImgixSubdomains, subdomain) {
+			t.Logf("cleanup: WARNING: source %s does not carry this test's subdomain %s, refusing to touch it", sourceID, subdomain)
+			return
+		}
+
+		name := src.Name
+		if !strings.HasPrefix(name, "zzz-delete-me ") {
+			name = "zzz-delete-me " + name
+		}
+		if _, err := client.UpdateSource(ctx, sourceID, map[string]interface{}{
+			"enabled": false,
+			"name":    name,
+		}); err != nil {
+			t.Logf("cleanup: WARNING: disabling/renaming source %s failed: %v", sourceID, err)
+			return
+		}
+		t.Logf("cleanup: source %s disabled and renamed to %q", sourceID, name)
+	})
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func testAccConfig(subdomain, name, params string, withSecrets bool, withAnnotation bool) string {
@@ -259,6 +320,7 @@ func TestAccSourceLifecycle(t *testing.T) {
 		t.Fatalf("domains must include %s.imgix.net: %v", subdomain, domains)
 	}
 	sourceID := values["id"].(string)
+	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), sourceID, subdomain)
 
 	w.expectEmptyPlan()
 
@@ -285,6 +347,7 @@ func TestAccSourceImportCleanPlan(t *testing.T) {
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values := w.stateValues()
 	sourceID := values["id"].(string)
+	testAccCleanupSource(t, imgix.NewClient(os.Getenv("IMGIX_API_KEY")), sourceID, subdomain)
 
 	// Drop state, switch to a config without the origin secret, and import:
 	// the imported resource must plan cleanly without recovering the secret.
@@ -310,6 +373,7 @@ func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
 	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true, true))
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	sourceID := w.stateValues()["id"].(string)
+	testAccCleanupSource(t, client, sourceID, subdomain)
 
 	modeled := map[string]bool{
 		"type": true, "imgix_subdomains": true, "gcs_bucket": true, "gcs_access_key": true,
@@ -372,6 +436,7 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	testAccCleanupSource(t, client, source.ID, subdomain)
 
 	err = client.DeleteSource(ctx, source.ID)
 	switch {
@@ -379,7 +444,7 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 		t.Logf("DELETE /sources/:id is supported: source %s deleted", source.ID)
 	case imgix.DeletionUnsupported(err):
 		t.Logf("VERIFIED: DELETE /sources/:id is not supported; destroy fails clearly by design. "+
-			"Probe source %s (%s.imgix.net) must be removed in the dashboard.", source.ID, subdomain)
+			"Probe source %s (%s.imgix.net) is disabled and renamed by cleanup.", source.ID, subdomain)
 	default:
 		t.Fatalf("unexpected deletion error for source %s: %v", source.ID, err)
 	}
@@ -434,6 +499,7 @@ resource "imgix_source" "test" {
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values := w.stateValues()
 	sourceID := values["id"].(string)
+	testAccCleanupSource(t, client, sourceID, subdomain)
 	if got := getImageError(sourceID); got != nil {
 		t.Fatalf("image_error must be null without configuration, got %v", got)
 	}
@@ -495,7 +561,7 @@ func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creating victim source: %v", err)
 	}
-	t.Logf("tf-acc victim source %s left in the Imgix account (API cannot delete) — remove in the dashboard", victim.ID)
+	testAccCleanupSource(t, client, victim.ID, victimSub)
 
 	// Let the victim finish deploying before snapshotting, so the comparison
 	// is not confounded by the legitimate deployment_status transition.
