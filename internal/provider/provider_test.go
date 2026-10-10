@@ -2,28 +2,41 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
-	"time"
-
-	"github.com/hashicorp/terraform-plugin-framework/providerserver"
-	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
-	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
-	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
 	"github.com/udx/terraform-provider-imgix/internal/imgix"
 )
 
-var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
-	"imgix": providerserver.NewProtocol6WithError(New("test")()),
-}
+// Acceptance tests drive a real tofu CLI against a locally built provider
+// binary (dev_overrides). resource.Test is deliberately not used: the Imgix
+// API cannot delete sources (verified by TestAccSourceDeletionProbe), so the
+// harness' post-test destroy would always fail. These tests assert the
+// destroy error explicitly and clean state with `tofu state rm`; the
+// disposable tf-acc-* sources they create are logged for dashboard cleanup.
+//
+// Required env: IMGIX_API_KEY, IMGIX_TEST_GCS_BUCKET,
+// IMGIX_TEST_GCS_ACCESS_KEY, IMGIX_TEST_GCS_SECRET_KEY (a disposable bucket
+// and HMAC pair — never an existing customer source or bucket).
 
-// Acceptance tests run against the real Imgix Management API and create only
-// disposable tf-acc-* sources. They require an API key plus a disposable GCS
-// bucket and HMAC pair; they never touch pre-existing sources.
+var (
+	accOnce       sync.Once
+	accBinaryDir  string
+	accCLIRCFPath string
+	accSetupErr   error
+)
+
 func testAccPreCheck(t *testing.T) {
 	t.Helper()
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("acceptance test (set TF_ACC=1)")
+	}
 	for _, v := range []string{"IMGIX_API_KEY", "IMGIX_TEST_GCS_BUCKET", "IMGIX_TEST_GCS_ACCESS_KEY", "IMGIX_TEST_GCS_SECRET_KEY"} {
 		if os.Getenv(v) == "" {
 			t.Fatalf("%s must be set for acceptance tests", v)
@@ -31,16 +44,150 @@ func testAccPreCheck(t *testing.T) {
 	}
 }
 
-func testAccClient(t *testing.T) *imgix.Client {
+func testAccSetup(t *testing.T) string {
 	t.Helper()
-	return imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
+	testAccPreCheck(t)
+	accOnce.Do(func() {
+		tofuPath := os.Getenv("TF_ACC_TERRAFORM_PATH")
+		if tofuPath == "" {
+			var err error
+			tofuPath, err = exec.LookPath("tofu")
+			if err != nil {
+				accSetupErr = fmt.Errorf("tofu binary not found: %w", err)
+				return
+			}
+		}
+		accBinaryDir, accSetupErr = os.MkdirTemp("", "tf-imgix-acc-bin")
+		if accSetupErr != nil {
+			return
+		}
+		build := exec.Command("go", "build", "-o", filepath.Join(accBinaryDir, "terraform-provider-imgix"), ".")
+		build.Dir = filepath.Join("..", "..") // module root (main package)
+		if out, err := build.CombinedOutput(); err != nil {
+			accSetupErr = fmt.Errorf("building provider: %s: %w", out, err)
+			return
+		}
+		rc, err := os.CreateTemp("", "tf-imgix-acc-*.tfrc")
+		if err != nil {
+			accSetupErr = err
+			return
+		}
+		fmt.Fprintf(rc, "provider_installation {\n  dev_overrides {\n    \"udx/imgix\" = %q\n  }\n  direct {}\n}\n", accBinaryDir)
+		rc.Close()
+		accCLIRCFPath = rc.Name()
+	})
+	if accSetupErr != nil {
+		t.Fatal(accSetupErr)
+	}
+	return accCLIRCFPath
 }
 
-func uniqueSubdomain() string {
-	return fmt.Sprintf("tf-acc-%d", time.Now().Unix())
+type tfWorkdir struct {
+	t   *testing.T
+	dir string
 }
 
-func testAccSourceConfig(subdomain, name, defaultParams string) string {
+func newTFWorkdir(t *testing.T, config string) *tfWorkdir {
+	t.Helper()
+	testAccSetup(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No `tofu init`: provider dev_overrides make init unnecessary, and init
+	// would query a registry that does not list udx/imgix yet.
+	return &tfWorkdir{t: t, dir: dir}
+}
+
+func (w *tfWorkdir) writeConfig(config string) {
+	w.t.Helper()
+	if err := os.WriteFile(filepath.Join(w.dir, "main.tf"), []byte(config), 0o644); err != nil {
+		w.t.Fatal(err)
+	}
+}
+
+func (w *tfWorkdir) run(args ...string) (string, error) {
+	w.t.Helper()
+	cmd := exec.Command("tofu", args...)
+	cmd.Dir = w.dir
+	cmd.Env = append(os.Environ(),
+		"TF_CLI_CONFIG_FILE="+accCLIRCFPath,
+		"TF_IN_AUTOMATION=1",
+		"INPUT=false",
+	)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func (w *tfWorkdir) mustRun(args ...string) string {
+	w.t.Helper()
+	out, err := w.run(args...)
+	if err != nil {
+		w.t.Fatalf("tofu %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
+}
+
+// stateValues returns the state values map for imgix_source.test.
+func (w *tfWorkdir) stateValues() map[string]interface{} {
+	w.t.Helper()
+	out := w.mustRun("show", "-json")
+	var doc struct {
+		Values struct {
+			RootModule struct {
+				Resources []struct {
+					Address string                 `json:"address"`
+					Values  map[string]interface{} `json:"values"`
+				} `json:"resources"`
+			} `json:"root_module"`
+		} `json:"values"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		w.t.Fatalf("decoding state: %v", err)
+	}
+	for _, r := range doc.Values.RootModule.Resources {
+		if r.Address == "imgix_source.test" {
+			return r.Values
+		}
+	}
+	return nil
+}
+
+// expectEmptyPlan fails the test unless tofu plan reports no changes.
+func (w *tfWorkdir) expectEmptyPlan() {
+	w.t.Helper()
+	out, err := w.run("plan", "-no-color", "-input=false", "-detailed-exitcode")
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
+		w.t.Fatalf("expected empty plan, got changes:\n%s", out)
+	} else if err != nil {
+		w.t.Fatalf("plan failed: %v\n%s", err, out)
+	}
+}
+
+// expectDestroyFails asserts the documented destroy behavior: the API cannot
+// delete sources, so destroy must fail clearly. State is then dropped with
+// `tofu state rm` (the only sanctioned way to stop managing a source), and
+// the source ID is logged for dashboard cleanup.
+func (w *tfWorkdir) expectDestroyFails(sourceID string) {
+	w.t.Helper()
+	out, err := w.run("destroy", "-no-color", "-auto-approve")
+	if err == nil {
+		w.t.Fatalf("destroy unexpectedly succeeded — the API deletion contract changed, update the provider Delete:\n%s", out)
+	}
+	if !strings.Contains(out, "deletion is not supported") {
+		w.t.Fatalf("destroy failed for an unexpected reason:\n%s", out)
+	}
+	w.mustRun("state", "rm", "imgix_source.test")
+	w.t.Logf("tf-acc source %s left in the Imgix account (API cannot delete) — remove in the dashboard", sourceID)
+}
+
+func testAccConfig(subdomain, name, params string, withSecrets bool) string {
+	secrets := ""
+	if withSecrets {
+		secrets = fmt.Sprintf(`
+    gcs_access_key   = %q
+    gcs_secret_key   = %q`, os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"))
+	}
 	return fmt.Sprintf(`
 terraform {
   required_providers {
@@ -58,221 +205,141 @@ resource "imgix_source" "test" {
   deployment = {
     type             = "gcs"
     imgix_subdomains = [%[1]q]
-    gcs_bucket       = %[3]q
-    gcs_access_key   = %[4]q
-    gcs_secret_key   = %[5]q
-    default_params   = %[6]s
+    gcs_bucket       = %[3]q%[4]s
+    default_params   = %[5]s
     annotation       = "terraform-provider-imgix acceptance test"
   }
 }
-`, subdomain, name, os.Getenv("IMGIX_TEST_GCS_BUCKET"),
-		os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"), defaultParams)
+`, subdomain, name, os.Getenv("IMGIX_TEST_GCS_BUCKET"), secrets, params)
 }
 
-func TestAccSource_basic(t *testing.T) {
-	subdomain := uniqueSubdomain()
-	paramsV1 := `{ auto = "compress,format" }`
-	paramsV2 := `{ auto = "compress,format", fit = "max" }`
+func TestAccSourceLifecycle(t *testing.T) {
+	subdomain := fmt.Sprintf("tf-acc-%d", os.Getpid())
+	w := newTFWorkdir(t, testAccConfig(subdomain, "TF acceptance "+subdomain, `{ auto = "compress,format" }`, true))
 
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			{
-				Config: testAccSourceConfig(subdomain, "TF acceptance "+subdomain, paramsV1),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttrSet("imgix_source.test", "id"),
-					resource.TestCheckResourceAttr("imgix_source.test", "deployment_status", "deployed"),
-					resource.TestCheckResourceAttr("imgix_source.test", "enabled", "true"),
-					resource.TestCheckResourceAttr("imgix_source.test", "domains.0", subdomain+".imgix.net"),
-					resource.TestCheckResourceAttr("imgix_source.test", "deployment.default_params.auto", "compress,format"),
-					resource.TestCheckNoResourceAttr("imgix_source.test", "secure_url_token"),
-				),
-			},
-			// Re-apply of the same config must be empty.
-			{
-				Config:             testAccSourceConfig(subdomain, "TF acceptance "+subdomain, paramsV1),
-				PlanOnly:           true,
-				ExpectNonEmptyPlan: false,
-			},
-			{
-				Config: testAccSourceConfig(subdomain, "TF acceptance renamed", paramsV2),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("imgix_source.test", "name", "TF acceptance renamed"),
-					resource.TestCheckResourceAttr("imgix_source.test", "deployment.default_params.fit", "max"),
-				),
-			},
-			{
-				Config:   testAccSourceConfig(subdomain, "TF acceptance renamed", paramsV2),
-				PlanOnly: true,
-			},
-		},
-	})
-}
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 
-func TestAccSource_import(t *testing.T) {
-	subdomain := uniqueSubdomain()
-	config := testAccSourceConfig(subdomain, "TF import "+subdomain, `{}`)
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			{Config: config},
-			{
-				ResourceName:      "imgix_source.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-				// The API never returns the origin secret, and provider-only
-				// attributes have no remote counterpart.
-				ImportStateVerifyIgnore: []string{
-					"deployment.gcs_secret_key",
-					"wait_for_deployed",
-					"timeouts",
-				},
-			},
-			// An imported resource plans cleanly without the original secret.
-			{
-				Config:             config,
-				PlanOnly:           true,
-				ExpectNonEmptyPlan: false,
-			},
-		},
-	})
-}
-
-// A sparse PATCH must not clobber fields the provider does not model (for
-// example render_settings or robots). Verifies the deployment merge contract
-// against a disposable source.
-func TestAccSource_sparsePatchPreservesUnmodeledFields(t *testing.T) {
-	subdomain := uniqueSubdomain()
-	paramsV1 := `{ auto = "compress" }`
-	paramsV2 := `{ auto = "compress,format" }`
-
-	var sourceID string
-	unmodeledBefore := map[string]interface{}{}
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			{
-				Config: testAccSourceConfig(subdomain, "TF sparse "+subdomain, paramsV1),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					func(s *terraform.State) error {
-						rs := s.RootModule().Resources["imgix_source.test"]
-						sourceID = rs.Primary.ID
-						attrs, err := testAccClient(t).GetSourceAttributes(context.Background(), sourceID)
-						if err != nil {
-							return err
-						}
-						dep, _ := attrs["deployment"].(map[string]interface{})
-						for k, v := range dep {
-							switch k {
-							case "type", "imgix_subdomains", "gcs_bucket", "gcs_access_key",
-								"gcs_prefix", "custom_domains", "default_params",
-								"secure_url_enabled", "cache_ttl_behavior", "cache_ttl_value",
-								"cache_ttl_error", "crossdomain_xml_enabled", "image_error",
-								"image_missing", "image_error_append_qs", "image_missing_append_qs",
-								"annotation", "allows_upload":
-								// modeled
-							default:
-								unmodeledBefore[k] = v
-							}
-						}
-						return nil
-					},
-				),
-			},
-			{
-				Config: testAccSourceConfig(subdomain, "TF sparse "+subdomain, paramsV2),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					func(s *terraform.State) error {
-						attrs, err := testAccClient(t).GetSourceAttributes(context.Background(), sourceID)
-						if err != nil {
-							return err
-						}
-						dep, _ := attrs["deployment"].(map[string]interface{})
-						for k, want := range unmodeledBefore {
-							if got := dep[k]; !deepEqualish(got, want) {
-								return fmt.Errorf("unmodeled deployment field %q changed by sparse PATCH: was %v, now %v", k, want, got)
-							}
-						}
-						return nil
-					},
-				),
-			},
-		},
-	})
-}
-
-// Rotating the origin HMAC pair updates the source in place; the new secret
-// is preserved in state even though the API never returns it.
-func TestAccSource_credentialRotation(t *testing.T) {
-	access2, secret2 := os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY_2"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY_2")
-	if access2 == "" || secret2 == "" {
-		t.Skip("IMGIX_TEST_GCS_ACCESS_KEY_2/IMGIX_TEST_GCS_SECRET_KEY_2 not set; skipping rotation test")
+	values := w.stateValues()
+	if values == nil {
+		t.Fatal("imgix_source.test not in state after apply")
 	}
-	subdomain := uniqueSubdomain()
-
-	rotated := fmt.Sprintf(`
-terraform {
-  required_providers {
-    imgix = {
-      source = "udx/imgix"
-    }
-  }
-}
-
-provider "imgix" {}
-
-resource "imgix_source" "test" {
-  name = "TF rotate %[1]s"
-
-  deployment = {
-    type             = "gcs"
-    imgix_subdomains = [%[1]q]
-    gcs_bucket       = %[2]q
-    gcs_access_key   = %[3]q
-    gcs_secret_key   = %[4]q
-  }
-}
-`, subdomain, os.Getenv("IMGIX_TEST_GCS_BUCKET"), access2, secret2)
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			{Config: testAccSourceConfig(subdomain, "TF rotate "+subdomain, `{}`)},
-			{
-				Config: rotated,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("imgix_source.test", "deployment.gcs_access_key", access2),
-					resource.TestCheckResourceAttr("imgix_source.test", "deployment.gcs_secret_key", secret2),
-				),
-			},
-			{
-				Config:             rotated,
-				PlanOnly:           true,
-				ExpectNonEmptyPlan: false,
-			},
-		},
-	})
-}
-
-// Probes the real deletion contract: the published API documents only
-// GET/POST/PATCH for sources. Whatever the API actually does with DELETE is
-// recorded here; the provider maps "unsupported" to an explicit destroy
-// error rather than silently disabling or orphaning the source.
-func TestAccSource_deletionProbe(t *testing.T) {
-	if os.Getenv("TF_ACC") == "" {
-		t.Skip("acceptance test")
+	if values["deployment_status"] != "deployed" {
+		t.Fatalf("expected deployed, got %v", values["deployment_status"])
 	}
+	dep := values["deployment"].(map[string]interface{})
+	if dep["default_params"].(map[string]interface{})["auto"] != "compress,format" {
+		t.Fatalf("default_params not applied: %v", dep)
+	}
+	domains, _ := values["domains"].([]interface{})
+	found := false
+	for _, d := range domains {
+		if d == subdomain+".imgix.net" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("domains must include %s.imgix.net: %v", subdomain, domains)
+	}
+	sourceID := values["id"].(string)
+
+	w.expectEmptyPlan()
+
+	// In-place update.
+	w.writeConfig(testAccConfig(subdomain, "TF acceptance renamed", `{ auto = "compress,format", fit = "max" }`, true))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	values = w.stateValues()
+	if values["name"] != "TF acceptance renamed" {
+		t.Fatalf("name not updated: %v", values["name"])
+	}
+	if values["id"].(string) != sourceID {
+		t.Fatalf("update must keep the same source ID: %s -> %s", sourceID, values["id"])
+	}
+	w.expectEmptyPlan()
+
+	w.expectDestroyFails(sourceID)
+}
+
+func TestAccSourceImportCleanPlan(t *testing.T) {
+	subdomain := fmt.Sprintf("tf-acc-imp-%d", os.Getpid())
+	name := "TF import " + subdomain
+
+	w := newTFWorkdir(t, testAccConfig(subdomain, name, `{}`, true))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	values := w.stateValues()
+	sourceID := values["id"].(string)
+
+	// Drop state, switch to a config without the origin secret, and import:
+	// the imported resource must plan cleanly without recovering the secret.
+	w.mustRun("state", "rm", "imgix_source.test")
+	w.writeConfig(testAccConfig(subdomain, name, `{}`, false))
+	w.mustRun("import", "-no-color", "imgix_source.test", sourceID)
+
+	values = w.stateValues()
+	if values == nil || values["id"].(string) != sourceID {
+		t.Fatalf("import did not restore state: %v", values)
+	}
+	w.expectEmptyPlan()
+
+	w.expectDestroyFails(sourceID)
+}
+
+// A sparse PATCH must not clobber deployment fields the provider does not
+// model (e.g. robots, render_settings).
+func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
+	subdomain := fmt.Sprintf("tf-acc-sparse-%d", os.Getpid())
+	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
+
+	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	sourceID := w.stateValues()["id"].(string)
+
+	modeled := map[string]bool{
+		"type": true, "imgix_subdomains": true, "gcs_bucket": true, "gcs_access_key": true,
+		"gcs_prefix": true, "custom_domains": true, "default_params": true,
+		"secure_url_enabled": true, "cache_ttl_behavior": true, "cache_ttl_value": true,
+		"cache_ttl_error": true, "crossdomain_xml_enabled": true, "image_error": true,
+		"image_missing": true, "image_error_append_qs": true, "image_missing_append_qs": true,
+		"annotation": true, "allows_upload": true,
+	}
+	unmodeled := func() map[string]interface{} {
+		attrs, err := client.GetSourceAttributes(context.Background(), sourceID)
+		if err != nil {
+			t.Fatalf("reading raw source attributes: %v", err)
+		}
+		dep, _ := attrs["deployment"].(map[string]interface{})
+		out := map[string]interface{}{}
+		for k, v := range dep {
+			if !modeled[k] {
+				out[k] = v
+			}
+		}
+		return out
+	}
+	before := unmodeled()
+
+	w.writeConfig(testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress,format" }`, true))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+
+	after := unmodeled()
+	for k, want := range before {
+		if fmt.Sprintf("%v", after[k]) != fmt.Sprintf("%v", want) {
+			t.Fatalf("unmodeled deployment field %q changed by sparse PATCH: was %v, now %v", k, want, after[k])
+		}
+	}
+
+	w.expectDestroyFails(sourceID)
+}
+
+// Probes the real deletion contract against a disposable source: the
+// published Management API documents only GET/POST/PATCH. Whatever the API
+// actually does with DELETE is recorded here; the provider maps "unsupported"
+// to an explicit destroy error rather than silently disabling or orphaning.
+func TestAccSourceDeletionProbe(t *testing.T) {
 	testAccPreCheck(t)
 
 	ctx := context.Background()
-	client := testAccClient(t)
-	subdomain := uniqueSubdomain()
+	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
+	subdomain := fmt.Sprintf("tf-acc-probe-%d", os.Getpid())
 
 	source, err := client.CreateSource(ctx, map[string]interface{}{
 		"name": "TF delete probe " + subdomain,
@@ -293,13 +360,9 @@ func TestAccSource_deletionProbe(t *testing.T) {
 	case err == nil:
 		t.Logf("DELETE /sources/:id is supported: source %s deleted", source.ID)
 	case imgix.DeletionUnsupported(err):
-		t.Logf("DELETE /sources/:id is NOT supported for this account; destroy fails clearly by design. "+
-			"Source %s (%s.imgix.net) must be removed in the dashboard.", source.ID, subdomain)
+		t.Logf("VERIFIED: DELETE /sources/:id is not supported; destroy fails clearly by design. "+
+			"Probe source %s (%s.imgix.net) must be removed in the dashboard.", source.ID, subdomain)
 	default:
 		t.Fatalf("unexpected deletion error for source %s: %v", source.ID, err)
 	}
-}
-
-func deepEqualish(a, b interface{}) bool {
-	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }

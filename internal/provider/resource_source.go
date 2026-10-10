@@ -92,6 +92,7 @@ func (r *SourceResource) Schema(ctx context.Context, req resource.SchemaRequest,
 			"name": schema.StringAttribute{
 				Required:    true,
 				Description: "Display name of the source. Distinct from the delivery hostname.",
+				Validators:  []validator.String{stringvalidator.LengthAtLeast(1)},
 			},
 			"enabled": schema.BoolAttribute{
 				Optional:      true,

@@ -115,6 +115,8 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 	model.Name = types.StringValue(src.Name)
 	if src.Enabled != nil {
 		model.Enabled = types.BoolValue(*src.Enabled)
+	} else if model.Enabled.IsUnknown() {
+		model.Enabled = types.BoolNull()
 	}
 	model.DeploymentStatus = types.StringValue(src.DeploymentStatus)
 	if src.DateDeployed != nil {
@@ -164,27 +166,44 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 
 		if dep.SecureURLEnabled != nil {
 			d.SecureURLEnabled = types.BoolValue(*dep.SecureURLEnabled)
+		} else if d.SecureURLEnabled.IsUnknown() {
+			d.SecureURLEnabled = types.BoolNull()
 		}
 		if dep.CacheTTLBehavior != "" {
 			d.CacheTTLBehavior = types.StringValue(dep.CacheTTLBehavior)
+		} else if d.CacheTTLBehavior.IsUnknown() {
+			d.CacheTTLBehavior = types.StringNull()
 		}
 		if dep.CacheTTLValue != nil {
 			d.CacheTTLValue = types.Int64Value(*dep.CacheTTLValue)
+		} else if d.CacheTTLValue.IsUnknown() {
+			d.CacheTTLValue = types.Int64Null()
 		}
 		if dep.CacheTTLError != nil {
 			d.CacheTTLError = types.Int64Value(*dep.CacheTTLError)
+		} else if d.CacheTTLError.IsUnknown() {
+			d.CacheTTLError = types.Int64Null()
 		}
 		if dep.CrossdomainXMLEnabled != nil {
 			d.CrossdomainXMLEnabled = types.BoolValue(*dep.CrossdomainXMLEnabled)
+		} else if d.CrossdomainXMLEnabled.IsUnknown() {
+			d.CrossdomainXMLEnabled = types.BoolNull()
 		}
 		if dep.ImageErrorAppendQS != nil {
 			d.ImageErrorAppendQS = types.BoolValue(*dep.ImageErrorAppendQS)
+		} else if d.ImageErrorAppendQS.IsUnknown() {
+			d.ImageErrorAppendQS = types.BoolNull()
 		}
 		if dep.ImageMissingAppendQS != nil {
 			d.ImageMissingAppendQS = types.BoolValue(*dep.ImageMissingAppendQS)
+		} else if d.ImageMissingAppendQS.IsUnknown() {
+			d.ImageMissingAppendQS = types.BoolNull()
 		}
 		if dep.AllowsUpload != nil {
 			d.AllowsUpload = types.BoolValue(*dep.AllowsUpload)
+		} else if d.AllowsUpload.IsUnknown() {
+			// Absent from the API means unknown — null in state, never false.
+			d.AllowsUpload = types.BoolNull()
 		}
 	}
 
