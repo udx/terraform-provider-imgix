@@ -1,0 +1,55 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./internal/... -v
+
+  acceptance:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.12.5
+      # The test harness requires TF_ACC_TERRAFORM_PATH to be an absolute path;
+      # a bare "tofu" is rejected with ExactBinPath error before any test runs.
+      - name: Resolve tofu path
+        run: echo "TF_ACC_TERRAFORM_PATH=$(command -v tofu)" >> "$GITHUB_ENV"
+      - name: Acceptance tests
+        run: go test ./internal/provider/ -timeout 20m -v
+        env:
+          TF_ACC: "1"
+          TF_ACC_PROVIDER_NAMESPACE: udx
+          TF_ACC_PROVIDER_HOST: registry.opentofu.org
+          IMGIX_API_KEY: ${{ secrets.IMGIX_API_KEY }}
+          IMGIX_TEST_GCS_BUCKET: ${{ secrets.IMGIX_TEST_GCS_BUCKET }}
+          IMGIX_TEST_GCS_ACCESS_KEY: ${{ secrets.IMGIX_TEST_GCS_ACCESS_KEY }}
+          IMGIX_TEST_GCS_SECRET_KEY: ${{ secrets.IMGIX_TEST_GCS_SECRET_KEY }}
