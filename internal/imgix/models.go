@@ -148,11 +148,17 @@ func (c *Client) FindSourceBySubdomains(ctx context.Context, subs []string) (*So
 // and also matches the requested name, so a pre-existing source can never be
 // adopted by accident.
 func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{}) (*Source, error) {
-	if existing := c.lookupByAttrs(ctx, attrs, false); existing != nil {
+	preflight, err := c.lookupByAttrs(ctx, attrs, false)
+	if err != nil {
+		// A failed preflight must not read as "absent": creating anyway could
+		// duplicate or conflict blindly.
+		return nil, fmt.Errorf("verifying imgix_subdomains are free before create: %w", err)
+	}
+	if preflight != nil {
 		return nil, &Error{
 			Status: 409,
 			Title:  "Conflict",
-			Detail: fmt.Sprintf("imgix_subdomains already belong to existing source %s (import it with `tofu import` instead of recreating)", existing.ID),
+			Detail: fmt.Sprintf("imgix_subdomains already belong to existing source %s (import it with `tofu import` instead of recreating)", preflight.ID),
 		}
 	}
 
@@ -169,7 +175,7 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 		// source when one owns the requested subdomains (e.g. it appeared
 		// between the preflight and the POST).
 		if apiErr.Status == 400 {
-			if found := c.lookupByAttrs(ctx, attrs, false); found != nil {
+			if found, _ := c.lookupByAttrs(ctx, attrs, false); found != nil {
 				apiErr.Detail = fmt.Sprintf("%s (conflicting source ID: %s)", apiErr.Detail, found.ID)
 			}
 		}
@@ -178,7 +184,7 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 
 	// Ambiguous failure and the source was proven absent before the POST:
 	// a now-matching source (subdomain set + name) is this create's result.
-	if found := c.lookupByAttrs(ctx, attrs, true); found != nil {
+	if found, _ := c.lookupByAttrs(ctx, attrs, true); found != nil {
 		return found, nil
 	}
 	return nil, err
@@ -186,26 +192,26 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 
 // lookupByAttrs finds the source matching the requested deployment
 // subdomains; with matchName, the name must also match (create recovery).
-func (c *Client) lookupByAttrs(ctx context.Context, attrs map[string]interface{}, matchName bool) *Source {
+func (c *Client) lookupByAttrs(ctx context.Context, attrs map[string]interface{}, matchName bool) (*Source, error) {
 	dep, ok := attrs["deployment"].(map[string]interface{})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	subs, ok := dep["imgix_subdomains"].([]string)
 	if !ok || len(subs) == 0 {
-		return nil
+		return nil, nil
 	}
 	found, err := c.FindSourceBySubdomains(ctx, subs)
 	if err != nil || found == nil {
-		return nil
+		return nil, err
 	}
 	if matchName {
 		name, _ := attrs["name"].(string)
 		if name == "" || found.Name != name {
-			return nil
+			return nil, nil
 		}
 	}
-	return found
+	return found, nil
 }
 
 // UpdateSource applies a sparse PATCH: only the attributes present in attrs

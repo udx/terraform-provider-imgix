@@ -144,9 +144,15 @@ func TestRetryOn429HonorsRetryAfter(t *testing.T) {
 func TestValidationErrorIsNotRetried(t *testing.T) {
 	var posts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			atomic.AddInt32(&posts, 1)
+		if r.Method == "GET" {
+			// Preflight + conflict lookups: no matching source.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": []map[string]interface{}{},
+				"meta": map[string]interface{}{"pagination": map[string]interface{}{"hasNextPage": false}},
+			})
+			return
 		}
+		atomic.AddInt32(&posts, 1)
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"errors": []map[string]interface{}{{"status": "400", "title": "BadRequest", "detail": "imgix_subdomains has already been taken"}},
@@ -167,6 +173,31 @@ func TestValidationErrorIsNotRetried(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already been taken") {
 		t.Fatalf("conflict detail must surface: %v", err)
+	}
+}
+
+func TestCreateFailsWhenPreflightFails(t *testing.T) {
+	var posts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			atomic.AddInt32(&posts, 1)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"errors": []map[string]interface{}{{"status": "500", "title": "Internal"}},
+		})
+	}))
+	defer server.Close()
+
+	_, err := testClient(server).CreateSource(context.Background(), map[string]interface{}{
+		"name":       "dup",
+		"deployment": map[string]interface{}{"type": "gcs", "imgix_subdomains": []string{"taken"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "verifying imgix_subdomains") {
+		t.Fatalf("preflight failure must fail the create with context: %v", err)
+	}
+	if atomic.LoadInt32(&posts) != 0 {
+		t.Fatal("POST sent despite failed preflight")
 	}
 }
 
@@ -512,4 +543,28 @@ func TestDeleteSemantics(t *testing.T) {
 			t.Fatalf("source gone must be success, got %v", err)
 		}
 	})
+}
+
+func TestRetryAfterHTTPDate(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After", time.Now().Add(1500*time.Millisecond).UTC().Format(http.TimeFormat))
+	err := decodeError(429, header, []byte(`{"errors":[{"status":"429","title":"TooManyRequests"}]}`))
+	if err.retryAfter <= 0 || err.retryAfter > 60*time.Second {
+		t.Fatalf("HTTP-date Retry-After not parsed: %v", err.retryAfter)
+	}
+	if err.Status != 429 {
+		t.Fatalf("status must stay the HTTP code, got %d", err.Status)
+	}
+}
+
+func TestBodyStatusNeverOverridesHTTPStatus(t *testing.T) {
+	// A malformed or stale body status must not reclassify the response:
+	// a 401 carrying "404" is an auth error, never NotFound.
+	err := decodeError(401, http.Header{}, []byte(`{"errors":[{"status":"404","title":"NotFound"}]}`))
+	if err.Status != 401 {
+		t.Fatalf("body status overrode HTTP status: %d", err.Status)
+	}
+	if NotFound(err) {
+		t.Fatal("401 must never classify as NotFound")
+	}
 }

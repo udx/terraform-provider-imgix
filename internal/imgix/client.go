@@ -232,11 +232,17 @@ func decodeError(status int, header http.Header, body []byte) *Error {
 	}
 	if status == http.StatusTooManyRequests {
 		if ra := header.Get("Retry-After"); ra != "" {
+			// Both standard forms: delay-seconds and HTTP-date.
+			d := -1 * time.Second
 			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-				d := time.Duration(secs) * time.Second
-				if d > 60*time.Second {
-					d = 60 * time.Second
-				}
+				d = time.Duration(secs) * time.Second
+			} else if ts, err := http.ParseTime(ra); err == nil {
+				d = time.Until(ts)
+			}
+			if d > 60*time.Second {
+				d = 60 * time.Second
+			}
+			if d > 0 {
 				apiErr.retryAfter = d
 			}
 		}

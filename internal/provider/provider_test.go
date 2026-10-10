@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"testing"
 
 	"github.com/udx/terraform-provider-imgix/internal/imgix"
@@ -183,6 +184,13 @@ func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 	w.t.Logf("tf-acc source %s left in the Imgix account (API cannot delete) — remove in the dashboard", sourceID)
 }
 
+// accSub returns a unique disposable subdomain for acceptance tests. Leftover
+// sources cannot be deleted through the API, so names must be globally unique
+// across runs (PID-based suffixes collide; nanosecond timestamps do not).
+func accSub(purpose string) string {
+	return fmt.Sprintf("tf-acc-%s-%d", purpose, time.Now().UnixNano())
+}
+
 func testAccConfig(subdomain, name, params string, withSecrets bool, withAnnotation bool) string {
 	if !strings.HasPrefix(subdomain, "tf-acc-") {
 		// Never let a test touch anything but disposable sources.
@@ -224,7 +232,7 @@ resource "imgix_source" "test" {
 }
 
 func TestAccSourceLifecycle(t *testing.T) {
-	subdomain := fmt.Sprintf("tf-acc-%d", os.Getpid())
+	subdomain := accSub("main")
 	w := newTFWorkdir(t, testAccConfig(subdomain, "TF acceptance "+subdomain, `{ auto = "compress,format" }`, true, true))
 
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
@@ -270,7 +278,7 @@ func TestAccSourceLifecycle(t *testing.T) {
 }
 
 func TestAccSourceImportCleanPlan(t *testing.T) {
-	subdomain := fmt.Sprintf("tf-acc-imp-%d", os.Getpid())
+	subdomain := accSub("imp")
 	name := "TF import " + subdomain
 
 	w := newTFWorkdir(t, testAccConfig(subdomain, name, `{}`, true, true))
@@ -296,7 +304,7 @@ func TestAccSourceImportCleanPlan(t *testing.T) {
 // A sparse PATCH must not clobber deployment fields the provider does not
 // model (e.g. robots, render_settings).
 func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
-	subdomain := fmt.Sprintf("tf-acc-sparse-%d", os.Getpid())
+	subdomain := accSub("sparse")
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 
 	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true, true))
@@ -349,7 +357,7 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 
 	ctx := context.Background()
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
-	subdomain := fmt.Sprintf("tf-acc-probe-%d", os.Getpid())
+	subdomain := accSub("probe")
 
 	source, err := client.CreateSource(ctx, map[string]interface{}{
 		"name": "TF delete probe " + subdomain,
@@ -382,7 +390,7 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 // "" = clear). The API validates fallback images by rendering them, so the
 // test uses the source's own deployed URL as a renderable fallback.
 func TestAccSourceClearableFields(t *testing.T) {
-	subdomain := fmt.Sprintf("tf-acc-clear-%d", os.Getpid())
+	subdomain := accSub("clear")
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 
 	configFor := func(imageErrorLine string) string {
@@ -473,7 +481,7 @@ func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 	ctx := context.Background()
 
 	// The pre-existing "victim": a disposable source owned by this test run.
-	victimSub := fmt.Sprintf("tf-acc-victim-%d", os.Getpid())
+	victimSub := accSub("victim")
 	victim, err := client.CreateSource(ctx, map[string]interface{}{
 		"name": "TF conflict victim " + victimSub,
 		"deployment": map[string]interface{}{
@@ -488,6 +496,12 @@ func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 		t.Fatalf("creating victim source: %v", err)
 	}
 	t.Logf("tf-acc victim source %s left in the Imgix account (API cannot delete) — remove in the dashboard", victim.ID)
+
+	// Let the victim finish deploying before snapshotting, so the comparison
+	// is not confounded by the legitimate deployment_status transition.
+	if _, err := client.WaitForStatus(ctx, victim.ID, false, 5*time.Second); err != nil {
+		t.Fatalf("victim source did not deploy: %v", err)
+	}
 
 	before, err := client.GetSourceAttributes(ctx, victim.ID)
 	if err != nil {
