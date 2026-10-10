@@ -153,20 +153,48 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 	}
 
 	var apiErr *Error
-	isHTTP4xx := errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 && apiErr.Status != 429
-	if isHTTP4xx {
-		return nil, err // validation/conflict errors are final
-	}
-
-	// Ambiguous failure: the source may exist. Recover by subdomain set.
-	if dep, ok := attrs["deployment"].(map[string]interface{}); ok {
-		if rawSubs, ok := dep["imgix_subdomains"].([]string); ok {
-			if found, findErr := c.FindSourceBySubdomains(ctx, rawSubs); findErr == nil && found != nil {
-				return found, nil
+	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 && apiErr.Status != 429 {
+		// Validation/conflict errors are final. Point at the conflicting
+		// source when one owns the requested subdomains.
+		if apiErr.Status == 400 {
+			if found := c.lookupByAttrs(ctx, attrs, false); found != nil {
+				apiErr.Detail = fmt.Sprintf("%s (conflicting source ID: %s)", apiErr.Detail, found.ID)
 			}
 		}
+		return nil, err
+	}
+
+	// Ambiguous failure: the source may exist. Recover by subdomain set and
+	// name — a pre-existing source with the same subdomains but a different
+	// name is not ours and must not be adopted by accident.
+	if found := c.lookupByAttrs(ctx, attrs, true); found != nil {
+		return found, nil
 	}
 	return nil, err
+}
+
+// lookupByAttrs finds the source matching the requested deployment
+// subdomains; with matchName, the name must also match (create recovery).
+func (c *Client) lookupByAttrs(ctx context.Context, attrs map[string]interface{}, matchName bool) *Source {
+	dep, ok := attrs["deployment"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	subs, ok := dep["imgix_subdomains"].([]string)
+	if !ok || len(subs) == 0 {
+		return nil
+	}
+	found, err := c.FindSourceBySubdomains(ctx, subs)
+	if err != nil || found == nil {
+		return nil
+	}
+	if matchName {
+		name, _ := attrs["name"].(string)
+		if name == "" || found.Name != name {
+			return nil
+		}
+	}
+	return found
 }
 
 // UpdateSource applies a sparse PATCH: only the attributes present in attrs
@@ -198,8 +226,14 @@ func (c *Client) DeleteSource(ctx context.Context, id string) error {
 		return ErrDeletionUnsupported
 	}
 	if NotFound(err) {
-		if _, getErr := c.GetSource(ctx, id); NotFound(getErr) {
+		_, getErr := c.GetSource(ctx, id)
+		if NotFound(getErr) {
 			return nil // already gone
+		}
+		if getErr != nil {
+			// The 404 is ambiguous (route miss vs. gone) and the verification
+			// read failed — surface the read failure, not a wrong verdict.
+			return fmt.Errorf("verifying delete of source %s: %w", id, getErr)
 		}
 		return ErrDeletionUnsupported // route miss: the source is still there
 	}
@@ -218,6 +252,11 @@ func (c *Client) WaitForStatus(ctx context.Context, id string, wantDisabled bool
 	for {
 		src, err := c.GetSource(ctx, id)
 		if err != nil && !NotFound(err) {
+			var apiErr *Error
+			if errors.As(err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
+				// Permanent auth failure: fail fast instead of timing out.
+				return nil, fmt.Errorf("waiting for source %s: %w", id, err)
+			}
 			// Read-after-write lag and transient errors: keep polling until the
 			// caller's context deadline.
 			lastStatus = "unreadable"

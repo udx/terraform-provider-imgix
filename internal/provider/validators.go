@@ -17,8 +17,9 @@ var (
 	// Full DNS hostname for custom domains (labels separated by dots).
 	dnsNameRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
 
-	// Absolute http(s) URL for fallback images.
-	absoluteURLRe = regexp.MustCompile(`^https?://\S+$`)
+	// Absolute http(s) URL for fallback images; empty string is the explicit
+	// "clear" sentinel handled by the clearableString plan modifier.
+	absoluteURLRe = regexp.MustCompile(`^(|https?://\S+)$`)
 )
 
 func subdomainValidator() validator.String {

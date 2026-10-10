@@ -374,3 +374,88 @@ func TestAccSourceDeletionProbe(t *testing.T) {
 		t.Fatalf("unexpected deletion error for source %s: %v", source.ID, err)
 	}
 }
+
+// Explicit empty strings clear nullable fields: image_error = "" must reach
+// the API as JSON null and leave a clean plan afterwards (null = unmanaged,
+// "" = clear). The API validates fallback images by rendering them, so the
+// test uses the source's own deployed URL as a renderable fallback.
+func TestAccSourceClearableFields(t *testing.T) {
+	subdomain := fmt.Sprintf("tf-acc-clear-%d", os.Getpid())
+	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
+
+	configFor := func(imageErrorLine string) string {
+		return fmt.Sprintf(`
+terraform {
+  required_providers {
+    imgix = {
+      source = "udx/imgix"
+    }
+  }
+}
+
+provider "imgix" {}
+
+resource "imgix_source" "test" {
+  name = "TF clear %[1]s"
+
+  deployment = {
+    type             = "gcs"
+    imgix_subdomains = [%[1]q]
+    gcs_bucket       = %[2]q
+    gcs_access_key   = %[3]q
+    gcs_secret_key   = %[4]q%[5]s
+  }
+}
+`, subdomain, os.Getenv("IMGIX_TEST_GCS_BUCKET"),
+			os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"), imageErrorLine)
+	}
+
+	getImageError := func(sourceID string) interface{} {
+		attrs, err := client.GetSourceAttributes(context.Background(), sourceID)
+		if err != nil {
+			t.Fatalf("reading raw source attributes: %v", err)
+		}
+		dep, _ := attrs["deployment"].(map[string]interface{})
+		return dep["image_error"]
+	}
+
+	// Phase 1: create without a fallback image.
+	w := newTFWorkdir(t, configFor(""))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	values := w.stateValues()
+	sourceID := values["id"].(string)
+	if got := getImageError(sourceID); got != nil {
+		t.Fatalf("image_error must be null without configuration, got %v", got)
+	}
+
+	// Phase 2: set a renderable fallback (this source serves test.png).
+	selfURL := fmt.Sprintf("https://%s.imgix.net/test.png", subdomain)
+	w.writeConfig(configFor(fmt.Sprintf(`
+    image_error      = %q`, selfURL)))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	if got := getImageError(sourceID); got != selfURL {
+		t.Fatalf("image_error not applied: %v", got)
+	}
+	if got := w.stateValues()["deployment"].(map[string]interface{})["image_error"]; got != selfURL {
+		t.Fatalf("state must hold the configured fallback, got %v", got)
+	}
+
+	// Phase 3: "" clears to JSON null on the API and null in state.
+	w.writeConfig(configFor(`
+    image_error      = ""`))
+	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
+	if got := getImageError(sourceID); got != nil {
+		t.Fatalf("image_error must be null after clearing, got %v", got)
+	}
+	values = w.stateValues()
+	// The "" sentinel is kept in state (not null): it is what makes the
+	// post-clear plan agree with the config, while the API holds null.
+	v, present := values["deployment"].(map[string]interface{})["image_error"]
+	s, isString := v.(string)
+	if !present || v == nil || !isString || s != "" {
+		t.Fatalf("state must hold the empty-string sentinel for the cleared field, got %#v", v)
+	}
+	w.expectEmptyPlan()
+
+	w.expectDestroyFails(sourceID)
+}

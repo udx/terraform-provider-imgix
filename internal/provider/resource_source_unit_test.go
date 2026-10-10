@@ -64,7 +64,7 @@ func TestDiffSourceSendsOnlyChangedManagedFields(t *testing.T) {
 	plan.Deployment.CacheTTLValue = types.Int64Value(86400)
 	state.Deployment.CacheTTLValue = types.Int64Value(31536000)
 
-	patch, depChanged, diags := diffSource(context.Background(), plan, state)
+	patch, depChanged, diags := diffSource(context.Background(), plan, state, nil)
 	if diags.HasError() {
 		t.Fatal(diags)
 	}
@@ -83,15 +83,16 @@ func TestDiffSourceExplicitClearSendsNull(t *testing.T) {
 	plan.Name = strVal("media")
 	state.Name = strVal("media")
 
-	// Config "" on a clearable string plans null; state holds a remote value.
-	plan.Deployment.ImageError = types.StringNull()
+	// Config "" on a clearable string plans as "" and is sent as JSON null;
+	// state holds the remote value before clearing.
+	plan.Deployment.ImageError = strVal("")
 	state.Deployment.ImageError = strVal("https://cdn.example.com/error.png")
 
 	// Unmanaged field (null config mirrored from state) must not diff.
 	plan.Deployment.Annotation = types.StringNull()
 	state.Deployment.Annotation = types.StringNull()
 
-	patch, depChanged, diags := diffSource(context.Background(), plan, state)
+	patch, depChanged, diags := diffSource(context.Background(), plan, state, nil)
 	if diags.HasError() {
 		t.Fatal(diags)
 	}
@@ -117,7 +118,7 @@ func TestDiffSourceEmptyCollectionsClear(t *testing.T) {
 	empty, _ := types.SetValueFrom(context.Background(), types.StringType, []string{})
 	plan.Deployment.CustomDomains = empty // explicit [] clears
 
-	patch, _, diags := diffSource(context.Background(), plan, state)
+	patch, _, diags := diffSource(context.Background(), plan, state, nil)
 	if diags.HasError() {
 		t.Fatal(diags)
 	}
@@ -169,14 +170,15 @@ func TestFlattenSourcePreservesSecretAndComputesDomains(t *testing.T) {
 		t.Fatal("absent allows_upload must stay unknown, not verified false")
 	}
 
-	// A previously known allows_upload survives an API response that omits it.
+	// A previously confirmed allows_upload is dropped when the API stops
+	// returning it: absent means unknown, not stale.
 	model.Deployment.AllowsUpload = types.BoolValue(true)
 	flattenSource(context.Background(), src, model, &diags)
 	if diags.HasError() {
 		t.Fatal(diags)
 	}
-	if !model.Deployment.AllowsUpload.Equal(types.BoolValue(true)) {
-		t.Fatal("known allows_upload must be preserved when the API omits it")
+	if !model.Deployment.AllowsUpload.IsNull() {
+		t.Fatal("absent allows_upload must become null, not retain a stale value")
 	}
 	if model.SecureURLToken.ValueString() != "tok123" {
 		t.Fatal("secure_url_token not flattened")
@@ -208,4 +210,57 @@ func TestFlattenSourceAbsentTokenClears(t *testing.T) {
 	if !model.SecureURLToken.IsNull() {
 		t.Fatal("absent secure_url_token must reset to null")
 	}
+}
+
+func TestDiffSourceAnnotationResendPolicy(t *testing.T) {
+	newModels := func(annotationPlan, annotationState, annotationCfg types.String) (*SourceResourceModel, *SourceResourceModel, *DeploymentModel) {
+		plan := &SourceResourceModel{Deployment: testDeploymentModel()}
+		state := &SourceResourceModel{Deployment: testDeploymentModel()}
+		plan.Name = strVal("media")
+		state.Name = strVal("media")
+		plan.Deployment.Annotation = annotationPlan
+		state.Deployment.Annotation = annotationState
+		// an unrelated managed change so a deployment PATCH exists
+		plan.Deployment.CacheTTLValue = types.Int64Value(86400)
+		state.Deployment.CacheTTLValue = types.Int64Value(31536000)
+		return plan, state, &DeploymentModel{Annotation: annotationCfg}
+	}
+
+	t.Run("configured annotation is resent on unrelated deployment patches", func(t *testing.T) {
+		plan, state, cfg := newModels(strVal("pinned"), strVal("pinned"), strVal("pinned"))
+		patch, _, diags := diffSource(context.Background(), plan, state, cfg)
+		if diags.HasError() {
+			t.Fatal(diags)
+		}
+		dep := patch["deployment"].(map[string]interface{})
+		if dep["annotation"] != "pinned" {
+			t.Fatalf("configured annotation must be resent: %v", dep)
+		}
+	})
+
+	t.Run("unmanaged annotation is never replayed over dashboard edits", func(t *testing.T) {
+		// Seeded at import ("old" from the API), not present in configuration.
+		plan, state, cfg := newModels(strVal("old"), strVal("old"), types.StringNull())
+		patch, _, diags := diffSource(context.Background(), plan, state, cfg)
+		if diags.HasError() {
+			t.Fatal(diags)
+		}
+		dep := patch["deployment"].(map[string]interface{})
+		if _, sent := dep["annotation"]; sent {
+			t.Fatalf("unmanaged annotation must not be replayed: %v", dep)
+		}
+	})
+
+	t.Run("explicit clear wins over resend", func(t *testing.T) {
+		plan, state, cfg := newModels(types.StringNull(), strVal("old"), strVal(""))
+		patch, _, diags := diffSource(context.Background(), plan, state, cfg)
+		if diags.HasError() {
+			t.Fatal(diags)
+		}
+		dep := patch["deployment"].(map[string]interface{})
+		v, ok := dep["annotation"]
+		if !ok || v != nil {
+			t.Fatalf("explicit clear must send JSON null: %v", dep)
+		}
+	})
 }

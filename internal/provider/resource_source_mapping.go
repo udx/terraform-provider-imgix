@@ -54,7 +54,13 @@ func expandDeployment(ctx context.Context, d *DeploymentModel) (map[string]inter
 // fields whose planned value differs from state. A planned null for a
 // clearable string sends JSON null (explicit clear); null collections and
 // null bools/ints are never sent (null there only ever means unmanaged).
-func diffSource(ctx context.Context, plan, state *SourceResourceModel) (map[string]interface{}, bool, diag.Diagnostics) {
+//
+// cfg carries the raw configuration for the deployment block; it is used to
+// resend an explicitly configured annotation with every deployment PATCH
+// (Imgix regenerates the annotation on any PATCH that omits it). An
+// unconfigured annotation is never replayed, so dashboard edits to an
+// unmanaged annotation survive.
+func diffSource(ctx context.Context, plan, state *SourceResourceModel, cfg *DeploymentModel) (map[string]interface{}, bool, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	patch := map[string]interface{}{}
 
@@ -103,10 +109,12 @@ func diffSource(ctx context.Context, plan, state *SourceResourceModel) (map[stri
 
 	if len(depPatch) > 0 {
 		// Any deployment PATCH that omits annotation makes the API regenerate
-		// it ("New deployment created for source by <user>"). Resend the
-		// configured value so unrelated updates don't churn it.
-		if _, patched := depPatch["annotation"]; !patched && !sd.Annotation.IsNull() && sd.Annotation.ValueString() != "" {
-			depPatch["annotation"] = sd.Annotation.ValueString()
+		// it ("New deployment created for source by <user>"). Resend the value
+		// only when annotation is explicitly configured; an unmanaged
+		// annotation is left alone so dashboard edits survive.
+		_, patched := depPatch["annotation"]
+		if !patched && cfg != nil && !cfg.Annotation.IsNull() && cfg.Annotation.ValueString() != "" {
+			depPatch["annotation"] = cfg.Annotation.ValueString()
 		}
 		patch["deployment"] = depPatch
 	}
@@ -155,9 +163,9 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 			d.GCSAccessKey = types.StringValue(dep.GCSAccessKey)
 		}
 		// GCSSecretKey is never returned by the API: keep the prior value.
-		d.GCSPrefix = stringPointerValue(dep.GCSPrefix)
-		d.ImageError = stringPointerValue(dep.ImageError)
-		d.ImageMissing = stringPointerValue(dep.ImageMissing)
+		d.GCSPrefix = clearableStringValue(dep.GCSPrefix, d.GCSPrefix)
+		d.ImageError = clearableStringValue(dep.ImageError, d.ImageError)
+		d.ImageMissing = clearableStringValue(dep.ImageMissing, d.ImageMissing)
 		// Annotation is write-only after creation: any deployment PATCH that
 		// omits it makes the API regenerate it, so the configured/state value
 		// is kept. Only seed from the API when the value is unknown (import).
@@ -216,8 +224,9 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 		}
 		if dep.AllowsUpload != nil {
 			d.AllowsUpload = types.BoolValue(*dep.AllowsUpload)
-		} else if d.AllowsUpload.IsUnknown() {
-			// Absent from the API means unknown — null in state, never false.
+		} else {
+			// Absent from the API means unknown — null in state, never false,
+			// and never a stale previously-confirmed value.
 			d.AllowsUpload = types.BoolNull()
 		}
 	}
@@ -233,7 +242,9 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 }
 
 func putString(m map[string]interface{}, key string, v types.String) {
-	if !v.IsNull() && !v.IsUnknown() {
+	// "" is the clear sentinel: on create the API default is already null,
+	// so it is omitted like an unset field.
+	if !v.IsNull() && !v.IsUnknown() && v.ValueString() != "" {
 		m[key] = v.ValueString()
 	}
 }
@@ -250,13 +261,13 @@ func putInt64(m map[string]interface{}, key string, v types.Int64) {
 	}
 }
 
-// diffString sends JSON null when the planned value is null (explicit clear
-// of a clearable string); every other changed value is sent verbatim.
+// diffString sends JSON null when the planned value is the explicit clear
+// sentinel ("") or null; every other changed value is sent verbatim.
 func diffString(m map[string]interface{}, key string, plan, state types.String) {
 	if plan.Equal(state) {
 		return
 	}
-	if plan.IsNull() {
+	if plan.IsNull() || plan.ValueString() == "" {
 		m[key] = nil
 		return
 	}
@@ -284,4 +295,17 @@ func stringPointerValue(p *string) types.String {
 		return types.StringNull()
 	}
 	return types.StringValue(*p)
+}
+
+// clearableStringValue maps a nullable API string onto state. The configured
+// "" sentinel survives an API null so post-clear plans stay clean; any other
+// prior value is honestly replaced by the API's null (drift is visible).
+func clearableStringValue(api *string, current types.String) types.String {
+	if api != nil {
+		return types.StringValue(*api)
+	}
+	if !current.IsNull() && !current.IsUnknown() && current.ValueString() == "" {
+		return current
+	}
+	return types.StringNull()
 }

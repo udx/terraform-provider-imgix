@@ -27,6 +27,7 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+	baseDelay  time.Duration // retry backoff base; 0 = 500ms
 }
 
 func NewClient(apiKey string) *Client {
@@ -129,7 +130,7 @@ func (c *Client) doRaw(ctx context.Context, method, path string, query url.Value
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			if err := sleep(ctx, backoff(attempt, lastErr)); err != nil {
+			if err := sleep(ctx, c.backoff(attempt, lastErr)); err != nil {
 				return nil, err
 			}
 		}
@@ -243,12 +244,16 @@ func decodeError(status int, header http.Header, body []byte) *Error {
 	return apiErr
 }
 
-func backoff(attempt int, lastErr error) time.Duration {
+func (c *Client) backoff(attempt int, lastErr error) time.Duration {
 	var apiErr *Error
 	if errors.As(lastErr, &apiErr) && apiErr.retryAfter > 0 {
 		return apiErr.retryAfter
 	}
-	d := time.Duration(500*(1<<(attempt-1))) * time.Millisecond
+	base := c.baseDelay
+	if base <= 0 {
+		base = 500 * time.Millisecond
+	}
+	d := base * (1 << (attempt - 1))
 	if d > 30*time.Second {
 		d = 30 * time.Second
 	}

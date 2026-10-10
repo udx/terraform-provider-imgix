@@ -174,7 +174,7 @@ func deploymentAttributes() map[string]schema.Attribute {
 			Optional:      true,
 			Computed:      true,
 			Description:   "Folder prefix prepended to image paths before resolving in GCS. Empty string clears.",
-			PlanModifiers: []planmodifier.String{clearableString()},
+			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
 		"custom_domains": schema.SetAttribute{
 			Optional:      true,
@@ -229,14 +229,14 @@ func deploymentAttributes() map[string]schema.Attribute {
 			Computed:      true,
 			Description:   "Absolute URL served when a request errors. Empty string clears.",
 			Validators:    []validator.String{absoluteURLValidator()},
-			PlanModifiers: []planmodifier.String{clearableString()},
+			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
 		"image_missing": schema.StringAttribute{
 			Optional:      true,
 			Computed:      true,
 			Description:   "Absolute URL served when the origin image is missing. Empty string clears.",
 			Validators:    []validator.String{absoluteURLValidator()},
-			PlanModifiers: []planmodifier.String{clearableString()},
+			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
 		"image_error_append_qs": schema.BoolAttribute{
 			Optional:      true,
@@ -254,7 +254,7 @@ func deploymentAttributes() map[string]schema.Attribute {
 			Optional:      true,
 			Computed:      true,
 			Description:   "Comment recorded on the deployment. Empty string clears.",
-			PlanModifiers: []planmodifier.String{clearableString()},
+			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
 		"allows_upload": schema.BoolAttribute{
 			Computed:      true,
@@ -323,6 +323,19 @@ func (r *SourceResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	// Persist the created source immediately: Terraform records state returned
+	// alongside error diagnostics, so a failed wait or refresh below leaves
+	// the source managed and the next apply converges via update instead of
+	// conflicting on the subdomains.
+	flattenSource(ctx, source, &plan, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	if plan.WaitForDeployed.ValueBool() {
 		if _, err := r.client.WaitForStatus(ctx, source.ID, wantDisabled(plan.Enabled), 5*time.Second); err != nil {
 			resp.Diagnostics.AddError("Imgix source did not reach its expected status", err.Error())
@@ -362,9 +375,10 @@ func (r *SourceResource) Read(ctx context.Context, req resource.ReadRequest, res
 }
 
 func (r *SourceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, state SourceResourceModel
+	var plan, state, config SourceResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -377,7 +391,7 @@ func (r *SourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	patch, depChanged, patchDiags := diffSource(ctx, &plan, &state)
+	patch, depChanged, patchDiags := diffSource(ctx, &plan, &state, config.Deployment)
 	resp.Diagnostics.Append(patchDiags...)
 	if resp.Diagnostics.HasError() {
 		return

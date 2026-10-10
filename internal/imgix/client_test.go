@@ -14,6 +14,7 @@ import (
 func testClient(server *httptest.Server) *Client {
 	c := NewClient("test-key")
 	c.baseURL = server.URL
+	c.baseDelay = time.Millisecond // keep retry tests fast
 	return c
 }
 
@@ -141,9 +142,11 @@ func TestRetryOn429HonorsRetryAfter(t *testing.T) {
 }
 
 func TestValidationErrorIsNotRetried(t *testing.T) {
-	var calls int32
+	var posts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
+		if r.Method == "POST" {
+			atomic.AddInt32(&posts, 1)
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"errors": []map[string]interface{}{{"status": "400", "title": "BadRequest", "detail": "imgix_subdomains has already been taken"}},
@@ -158,8 +161,9 @@ func TestValidationErrorIsNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if atomic.LoadInt32(&calls) != 1 {
-		t.Fatalf("400 must not be retried, got %d calls", calls)
+	// The follow-up conflict-lookup GET is expected; the POST must not repeat.
+	if atomic.LoadInt32(&posts) != 1 {
+		t.Fatalf("400 must not be retried, got %d POST calls", posts)
 	}
 	if !strings.Contains(err.Error(), "already been taken") {
 		t.Fatalf("conflict detail must surface: %v", err)
@@ -342,11 +346,33 @@ func TestWaitForStatusTerminals(t *testing.T) {
 		}))
 		defer server.Close()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_, err := testClient(server).WaitForStatus(ctx, "id9", false, time.Millisecond)
 		if err == nil || !strings.Contains(err.Error(), "id9") || !strings.Contains(err.Error(), "deploying") {
 			t.Fatalf("timeout must name source and last status: %v", err)
+		}
+	})
+
+	t.Run("auth failure fails fast", func(t *testing.T) {
+		var calls int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&calls, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"errors": []map[string]interface{}{{"status": "401", "title": "Unauthorized"}},
+			})
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := testClient(server).WaitForStatus(ctx, "id1", false, time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "401") {
+			t.Fatalf("expected fast auth failure, got %v", err)
+		}
+		if atomic.LoadInt32(&calls) > 3 {
+			t.Fatalf("auth failure must not be polled until timeout, got %d calls", calls)
 		}
 	})
 }
@@ -394,6 +420,32 @@ func TestDeleteSemantics(t *testing.T) {
 		defer server.Close()
 		if err := testClient(server).DeleteSource(context.Background(), "id1"); !DeletionUnsupported(err) {
 			t.Fatalf("expected ErrDeletionUnsupported, got %v", err)
+		}
+	})
+
+	t.Run("404 verification read failure surfaces", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "DELETE" {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"errors": []map[string]interface{}{{"status": "404", "title": "NotFound"}},
+				})
+				return
+			}
+			// The verification GET fails transiently — that is not proof of
+			// an unsupported DELETE.
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"errors": []map[string]interface{}{{"status": "500", "title": "Internal"}},
+			})
+		}))
+		defer server.Close()
+		err := testClient(server).DeleteSource(context.Background(), "id1")
+		if DeletionUnsupported(err) {
+			t.Fatalf("a failed verification GET must not masquerade as unsupported deletion: %v", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "verifying delete") {
+			t.Fatalf("expected the GET failure to surface, got %v", err)
 		}
 	})
 
