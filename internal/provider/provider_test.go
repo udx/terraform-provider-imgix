@@ -464,19 +464,32 @@ resource "imgix_source" "test" {
 
 // A config claiming a subdomain that belongs to an existing source must fail
 // at create with the conflict error naming the owner, and must leave the
-// existing source byte-identical. This is the "cannot clobber real sources"
-// guarantee, exercised against a live production source.
+// existing source byte-identical. The victim is a disposable source created
+// by the test itself — the acceptance suite never targets sources it did not
+// create, not even read-only probes against production.
 func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
 	testAccPreCheck(t)
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 	ctx := context.Background()
 
-	// Any deployed source we do not own; read-only.
-	existing, err := client.FindSourceBySubdomains(ctx, []string{"media-icamiami-org"})
-	if err != nil || existing == nil {
-		t.Fatalf("probe source unavailable: %v", err)
+	// The pre-existing "victim": a disposable source owned by this test run.
+	victimSub := fmt.Sprintf("tf-acc-victim-%d", os.Getpid())
+	victim, err := client.CreateSource(ctx, map[string]interface{}{
+		"name": "TF conflict victim " + victimSub,
+		"deployment": map[string]interface{}{
+			"type":             "gcs",
+			"imgix_subdomains": []string{victimSub},
+			"gcs_bucket":       os.Getenv("IMGIX_TEST_GCS_BUCKET"),
+			"gcs_access_key":   os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"),
+			"gcs_secret_key":   os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating victim source: %v", err)
 	}
-	before, err := client.GetSourceAttributes(ctx, existing.ID)
+	t.Logf("tf-acc victim source %s left in the Imgix account (API cannot delete) — remove in the dashboard", victim.ID)
+
+	before, err := client.GetSourceAttributes(ctx, victim.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,13 +510,13 @@ resource "imgix_source" "test" {
 
   deployment = {
     type             = "gcs"
-    imgix_subdomains = ["media-icamiami-org"]
-    gcs_bucket       = %[1]q
-    gcs_access_key   = %[2]q
-    gcs_secret_key   = %[3]q
+    imgix_subdomains = [%[1]q]
+    gcs_bucket       = %[2]q
+    gcs_access_key   = %[3]q
+    gcs_secret_key   = %[4]q
   }
 }
-`, os.Getenv("IMGIX_TEST_GCS_BUCKET"),
+`, victimSub, os.Getenv("IMGIX_TEST_GCS_BUCKET"),
 		os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"))
 
 	w := newTFWorkdir(t, config)
@@ -511,11 +524,11 @@ resource "imgix_source" "test" {
 	if applyErr == nil {
 		t.Fatalf("create with a taken subdomain unexpectedly succeeded:\n%s", out)
 	}
-	if !strings.Contains(out, existing.ID) {
-		t.Fatalf("conflict error must name the owning source ID %s:\n%s", existing.ID, out)
+	if !strings.Contains(out, victim.ID) {
+		t.Fatalf("conflict error must name the owning source ID %s:\n%s", victim.ID, out)
 	}
 
-	after, err := client.GetSourceAttributes(ctx, existing.ID)
+	after, err := client.GetSourceAttributes(ctx, victim.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

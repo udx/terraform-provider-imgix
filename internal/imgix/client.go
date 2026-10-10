@@ -214,15 +214,15 @@ func (c *Client) list(ctx context.Context, path string, query url.Values) ([]jso
 }
 
 func decodeError(status int, header http.Header, body []byte) *Error {
+	// The HTTP status code is authoritative for control flow; the body's
+	// status field is informational only (a malformed or stale body status
+	// must never reclassify the response).
 	apiErr := &Error{Status: status}
 	var env errorEnvelope
 	if err := json.Unmarshal(body, &env); err == nil && len(env.Errors) > 0 {
 		apiErr.Title = env.Errors[0].Title
 		apiErr.Detail = env.Errors[0].Detail
 		apiErr.RequestID = env.Errors[0].ID
-		if n, convErr := strconv.Atoi(env.Errors[0].Status); convErr == nil {
-			apiErr.Status = n
-		}
 	}
 	if apiErr.Title == "" {
 		apiErr.Title = http.StatusText(status)
