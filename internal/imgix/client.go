@@ -88,10 +88,13 @@ type document struct {
 }
 
 type listDocument struct {
-	Data  []json.RawMessage `json:"data"`
-	Links struct {
-		Next string `json:"next"`
-	} `json:"links"`
+	Data []json.RawMessage `json:"data"`
+	Meta struct {
+		Pagination struct {
+			HasNextPage bool `json:"hasNextPage"`
+			NextPage    int  `json:"nextPage"`
+		} `json:"pagination"`
+	} `json:"meta"`
 }
 
 // do performs one API call and returns the decoded "data" member. Retryable
@@ -99,6 +102,22 @@ type listDocument struct {
 // transport errors; non-retryable calls (creates) are only retried on 429,
 // which is rejected before anything is committed server-side.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, payload interface{}, retryable bool) (json.RawMessage, error) {
+	body, err := c.doRaw(ctx, method, path, query, payload, retryable)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, nil
+	}
+	var doc document
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return doc.Data, nil
+}
+
+// doRaw performs one API call with bounded retry and returns the raw body.
+func (c *Client) doRaw(ctx context.Context, method, path string, query url.Values, payload interface{}, retryable bool) ([]byte, error) {
 	var body []byte
 	var err error
 	if payload != nil {
@@ -158,66 +177,38 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			}
 			continue
 		}
-
-		if len(respBody) == 0 {
-			return nil, nil
-		}
-		var doc document
-		if err := json.Unmarshal(respBody, &doc); err != nil {
-			return nil, fmt.Errorf("decoding response: %w", err)
-		}
-		return doc.Data, nil
+		return respBody, nil
 	}
 	return nil, fmt.Errorf("giving up after %d attempts: %w", maxAttempts, lastErr)
 }
 
-// list follows JSON:API pagination (links.next) and returns every data member.
+// list follows the API's meta.pagination (page[number] parameters; the API
+// does not emit JSON:API links) and returns every data member.
 func (c *Client) list(ctx context.Context, path string, query url.Values) ([]json.RawMessage, error) {
 	var out []json.RawMessage
-	next := ""
-	for page := 0; ; page++ {
+	if query == nil {
+		query = url.Values{}
+	}
+	page := 0
+	for {
 		if page >= maxListPages {
 			return nil, fmt.Errorf("listing %s: exceeded %d pages", path, maxListPages)
 		}
+		query.Set("page[number]", strconv.Itoa(page))
 
-		var raw []byte
+		raw, err := c.doRaw(ctx, http.MethodGet, path, query, nil, true)
+		if err != nil {
+			return nil, err
+		}
 		var doc listDocument
-
-		// links.next is an absolute URL; request it directly, preserving auth.
-		reqURL := c.baseURL + path
-		if next != "" {
-			reqURL = next
-		} else if len(query) > 0 {
-			reqURL += "?" + query.Encode()
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("building request: %w", err)
-		}
-		req.Header.Set("Accept", jsonAPIType)
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		raw, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			return nil, decodeError(resp.StatusCode, resp.Header, raw)
-		}
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return nil, fmt.Errorf("decoding response: %w", err)
 		}
 		out = append(out, doc.Data...)
-		if doc.Links.Next == "" {
+		if !doc.Meta.Pagination.HasNextPage {
 			return out, nil
 		}
-		next = doc.Links.Next
+		page = doc.Meta.Pagination.NextPage
 	}
 }
 

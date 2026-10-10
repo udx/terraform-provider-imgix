@@ -253,25 +253,30 @@ func TestSparsePatchSendsOnlyManagedFields(t *testing.T) {
 
 func TestListFollowsPagination(t *testing.T) {
 	var page2Hits int32
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("page") == "2" {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page[number]") {
+		case "1":
 			atomic.AddInt32(&page2Hits, 1)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"data": []map[string]interface{}{{
 					"type": "sources", "id": "b",
 					"attributes": map[string]interface{}{"name": "b"},
 				}},
+				"meta": map[string]interface{}{"pagination": map[string]interface{}{
+					"currentPage": 1, "hasNextPage": false,
+				}},
 			})
-			return
+		default:
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": []map[string]interface{}{{
+					"type": "sources", "id": "a",
+					"attributes": map[string]interface{}{"name": "a"},
+				}},
+				"meta": map[string]interface{}{"pagination": map[string]interface{}{
+					"currentPage": 0, "hasNextPage": true, "nextPage": 1,
+				}},
+			})
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"data": []map[string]interface{}{{
-				"type": "sources", "id": "a",
-				"attributes": map[string]interface{}{"name": "a"},
-			}},
-			"links": map[string]interface{}{"next": server.URL + "/sources?page=2"},
-		})
 	}))
 	defer server.Close()
 

@@ -119,6 +119,10 @@ func diffSource(ctx context.Context, plan, state *SourceResourceModel) (map[stri
 func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResourceModel, diags *diag.Diagnostics) {
 	model.ID = types.StringValue(src.ID)
 	model.Name = types.StringValue(src.Name)
+	if model.WaitForDeployed.IsNull() || model.WaitForDeployed.IsUnknown() {
+		// Provider-side default, normalized into state (matters after import).
+		model.WaitForDeployed = types.BoolValue(true)
+	}
 	if src.Enabled != nil {
 		model.Enabled = types.BoolValue(*src.Enabled)
 	} else if model.Enabled.IsUnknown() {

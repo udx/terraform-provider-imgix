@@ -27,10 +27,9 @@ func (m clearableStringModifier) MarkdownDescription(ctx context.Context) string
 
 func (m clearableStringModifier) PlanModifyString(ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
 	if req.ConfigValue.IsNull() {
-		// Unmanaged: mirror prior state when the framework would plan unknown.
-		if req.PlanValue.IsUnknown() && !req.StateValue.IsNull() {
-			resp.PlanValue = req.StateValue
-		}
+		// Unmanaged: mirror prior state verbatim (including null), so
+		// post-import plans are clean.
+		resp.PlanValue = req.StateValue
 		return
 	}
 	if req.ConfigValue.ValueString() == "" {

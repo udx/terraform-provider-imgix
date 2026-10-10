@@ -181,10 +181,15 @@ func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 	w.t.Logf("tf-acc source %s left in the Imgix account (API cannot delete) — remove in the dashboard", sourceID)
 }
 
-func testAccConfig(subdomain, name, params string, withSecrets bool) string {
+func testAccConfig(subdomain, name, params string, withSecrets bool, withAnnotation bool) string {
 	if !strings.HasPrefix(subdomain, "tf-acc-") {
 		// Never let a test touch anything but disposable sources.
 		panic(fmt.Sprintf("test subdomain %q must start with tf-acc-", subdomain))
+	}
+	annotation := ""
+	if withAnnotation {
+		annotation = `
+    annotation       = "terraform-provider-imgix acceptance test"`
 	}
 	secrets := ""
 	if withSecrets {
@@ -210,16 +215,15 @@ resource "imgix_source" "test" {
     type             = "gcs"
     imgix_subdomains = [%[1]q]
     gcs_bucket       = %[3]q%[4]s
-    default_params   = %[5]s
-    annotation       = "terraform-provider-imgix acceptance test"
+    default_params   = %[5]s%[6]s
   }
 }
-`, subdomain, name, os.Getenv("IMGIX_TEST_GCS_BUCKET"), secrets, params)
+`, subdomain, name, os.Getenv("IMGIX_TEST_GCS_BUCKET"), secrets, params, annotation)
 }
 
 func TestAccSourceLifecycle(t *testing.T) {
 	subdomain := fmt.Sprintf("tf-acc-%d", os.Getpid())
-	w := newTFWorkdir(t, testAccConfig(subdomain, "TF acceptance "+subdomain, `{ auto = "compress,format" }`, true))
+	w := newTFWorkdir(t, testAccConfig(subdomain, "TF acceptance "+subdomain, `{ auto = "compress,format" }`, true, true))
 
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 
@@ -249,7 +253,7 @@ func TestAccSourceLifecycle(t *testing.T) {
 	w.expectEmptyPlan()
 
 	// In-place update.
-	w.writeConfig(testAccConfig(subdomain, "TF acceptance renamed", `{ auto = "compress,format", fit = "max" }`, true))
+	w.writeConfig(testAccConfig(subdomain, "TF acceptance renamed", `{ auto = "compress,format", fit = "max" }`, true, true))
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values = w.stateValues()
 	if values["name"] != "TF acceptance renamed" {
@@ -267,7 +271,7 @@ func TestAccSourceImportCleanPlan(t *testing.T) {
 	subdomain := fmt.Sprintf("tf-acc-imp-%d", os.Getpid())
 	name := "TF import " + subdomain
 
-	w := newTFWorkdir(t, testAccConfig(subdomain, name, `{}`, true))
+	w := newTFWorkdir(t, testAccConfig(subdomain, name, `{}`, true, true))
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	values := w.stateValues()
 	sourceID := values["id"].(string)
@@ -275,7 +279,7 @@ func TestAccSourceImportCleanPlan(t *testing.T) {
 	// Drop state, switch to a config without the origin secret, and import:
 	// the imported resource must plan cleanly without recovering the secret.
 	w.mustRun("state", "rm", "imgix_source.test")
-	w.writeConfig(testAccConfig(subdomain, name, `{}`, false))
+	w.writeConfig(testAccConfig(subdomain, name, `{}`, false, false))
 	w.mustRun("import", "-no-color", "imgix_source.test", sourceID)
 
 	values = w.stateValues()
@@ -293,7 +297,7 @@ func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
 	subdomain := fmt.Sprintf("tf-acc-sparse-%d", os.Getpid())
 	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
 
-	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true))
+	w := newTFWorkdir(t, testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress" }`, true, true))
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 	sourceID := w.stateValues()["id"].(string)
 
@@ -321,7 +325,7 @@ func TestAccSourceSparsePatchPreservesUnmodeled(t *testing.T) {
 	}
 	before := unmodeled()
 
-	w.writeConfig(testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress,format" }`, true))
+	w.writeConfig(testAccConfig(subdomain, "TF sparse "+subdomain, `{ auto = "compress,format" }`, true, true))
 	w.mustRun("apply", "-no-color", "-auto-approve", "-input=false")
 
 	after := unmodeled()
