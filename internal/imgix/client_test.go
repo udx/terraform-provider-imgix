@@ -172,11 +172,14 @@ func TestValidationErrorIsNotRetried(t *testing.T) {
 
 func TestAmbiguousCreateRecoversBySubdomains(t *testing.T) {
 	var posts int32
+	var gets int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "POST" && r.URL.Path == "/sources":
+			if atomic.AddInt32(&posts, 1) > 1 {
+				t.Fatal("duplicate POST sent")
+			}
 			// Commit server-side, then drop the connection before responding.
-			atomic.AddInt32(&posts, 1)
 			hj, ok := w.(http.Hijacker)
 			if !ok {
 				t.Fatal("hijacking unsupported")
@@ -184,6 +187,15 @@ func TestAmbiguousCreateRecoversBySubdomains(t *testing.T) {
 			conn, _, _ := hj.Hijack()
 			conn.Close()
 		case r.Method == "GET" && r.URL.Path == "/sources":
+			// First GET is the preflight absence check (empty); the GET after
+			// the failed POST finds the committed source.
+			if atomic.AddInt32(&gets, 1) == 1 {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": []map[string]interface{}{},
+					"meta": map[string]interface{}{"pagination": map[string]interface{}{"hasNextPage": false}},
+				})
+				return
+			}
 			if got := r.URL.Query().Get("filter[deployment.imgix_subdomains]"); got != "recovered" {
 				t.Fatalf("unexpected filter %q", got)
 			}
@@ -222,6 +234,45 @@ func TestAmbiguousCreateRecoversBySubdomains(t *testing.T) {
 	}
 	if atomic.LoadInt32(&posts) != 1 {
 		t.Fatalf("a duplicate POST would have been sent %d times", posts)
+	}
+}
+
+func TestCreatePreflightConflictNeverPosts(t *testing.T) {
+	var posts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			atomic.AddInt32(&posts, 1)
+			t.Fatal("POST must never happen when the preflight finds the subdomains taken")
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []map[string]interface{}{{
+				"type": "sources",
+				"id":   "existing-id",
+				"attributes": map[string]interface{}{
+					"name": "someone else's source",
+					"deployment": map[string]interface{}{
+						"type":             "gcs",
+						"imgix_subdomains": []string{"taken"},
+					},
+				},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	_, err := testClient(server).CreateSource(context.Background(), map[string]interface{}{
+		"name": "my new source",
+		"deployment": map[string]interface{}{
+			"type":             "gcs",
+			"imgix_subdomains": []string{"taken"},
+			"gcs_bucket":       "bucket",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "existing-id") {
+		t.Fatalf("conflict must name the owning source: %v", err)
+	}
+	if atomic.LoadInt32(&posts) != 0 {
+		t.Fatal("POST sent despite preflight conflict")
 	}
 }
 

@@ -29,6 +29,7 @@ var (
 	accOnce       sync.Once
 	accBinaryDir  string
 	accCLIRCFPath string
+	accTofuPath   string
 	accSetupErr   error
 )
 
@@ -57,6 +58,7 @@ func testAccSetup(t *testing.T) string {
 				return
 			}
 		}
+		accTofuPath = tofuPath
 		accBinaryDir, accSetupErr = os.MkdirTemp("", "tf-imgix-acc-bin")
 		if accSetupErr != nil {
 			return
@@ -108,7 +110,7 @@ func (w *tfWorkdir) writeConfig(config string) {
 
 func (w *tfWorkdir) run(args ...string) (string, error) {
 	w.t.Helper()
-	cmd := exec.Command("tofu", args...)
+	cmd := exec.Command(accTofuPath, args...)
 	cmd.Dir = w.dir
 	cmd.Env = append(os.Environ(),
 		"TF_CLI_CONFIG_FILE="+accCLIRCFPath,

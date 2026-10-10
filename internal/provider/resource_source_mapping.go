@@ -110,11 +110,16 @@ func diffSource(ctx context.Context, plan, state *SourceResourceModel, cfg *Depl
 	if len(depPatch) > 0 {
 		// Any deployment PATCH that omits annotation makes the API regenerate
 		// it ("New deployment created for source by <user>"). Resend the value
-		// only when annotation is explicitly configured; an unmanaged
+		// only when annotation is explicitly configured (JSON null when
+		// configured as an empty string, re-asserting the clear); an unmanaged
 		// annotation is left alone so dashboard edits survive.
 		_, patched := depPatch["annotation"]
-		if !patched && cfg != nil && !cfg.Annotation.IsNull() && cfg.Annotation.ValueString() != "" {
-			depPatch["annotation"] = cfg.Annotation.ValueString()
+		if !patched && cfg != nil && !cfg.Annotation.IsNull() && !cfg.Annotation.IsUnknown() {
+			if cfg.Annotation.ValueString() == "" {
+				depPatch["annotation"] = nil
+			} else {
+				depPatch["annotation"] = cfg.Annotation.ValueString()
+			}
 		}
 		patch["deployment"] = depPatch
 	}

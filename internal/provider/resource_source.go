@@ -123,7 +123,7 @@ func (r *SourceResource) Schema(ctx context.Context, req resource.SchemaRequest,
 			"secure_url_token": schema.StringAttribute{
 				Computed:    true,
 				Sensitive:   true,
-				Description: "Signing token for secured sources. Only present when secure_url_enabled is true.",
+				Description: "Signing token for the source when the API returns one; it may be present even when secure_url_enabled is false.",
 			},
 			"domains": schema.SetAttribute{
 				Computed:    true,
@@ -257,9 +257,10 @@ func deploymentAttributes() map[string]schema.Attribute {
 			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
 		"allows_upload": schema.BoolAttribute{
-			Computed:      true,
-			Description:   "Whether Imgix can upload to the origin. Absent from the API means unknown, not false.",
-			PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
+			Computed:    true,
+			Description: "Whether Imgix can upload to the origin. Absent from the API means unknown, not false.",
+			// No UseStateForUnknown: the API may omit this after an update, and
+			// flattening then records null — the plan must tolerate that.
 		},
 	}
 }
@@ -391,7 +392,7 @@ func (r *SourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	patch, depChanged, patchDiags := diffSource(ctx, &plan, &state, config.Deployment)
+	patch, _, patchDiags := diffSource(ctx, &plan, &state, config.Deployment)
 	resp.Diagnostics.Append(patchDiags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -403,11 +404,21 @@ func (r *SourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 			resp.Diagnostics.AddError("Error updating Imgix source "+id, err.Error())
 			return
 		}
-		if plan.WaitForDeployed.ValueBool() && (depChanged || patch["enabled"] != nil) {
-			if _, err := r.client.WaitForStatus(ctx, id, wantDisabled(plan.Enabled), 5*time.Second); err != nil {
-				resp.Diagnostics.AddError("Imgix source did not reach its expected status", err.Error())
-				return
-			}
+	}
+	// Wait when a patch triggered a deploy — but also when the source is not
+	// at its intended terminal state anyway (e.g. a previous create/update
+	// timed out after persisting state), so a retry does not silently succeed
+	// while the source is still deploying.
+	wantDisabledNow := wantDisabled(plan.Enabled)
+	targetStatus := "deployed"
+	if wantDisabledNow {
+		targetStatus = "disabled"
+	}
+	statusPending := state.DeploymentStatus.ValueString() != targetStatus
+	if plan.WaitForDeployed.ValueBool() && (len(patch) > 0 || statusPending) {
+		if _, err := r.client.WaitForStatus(ctx, id, wantDisabledNow, 5*time.Second); err != nil {
+			resp.Diagnostics.AddError("Imgix source did not reach its expected status", err.Error())
+			return
 		}
 	}
 

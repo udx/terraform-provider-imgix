@@ -251,6 +251,20 @@ func TestDiffSourceAnnotationResendPolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("configured empty annotation re-asserts the clear on unrelated patches", func(t *testing.T) {
+		// plan == state == "" (clear already applied), unrelated TTL change.
+		plan, state, cfg := newModels(strVal(""), strVal(""), strVal(""))
+		patch, _, diags := diffSource(context.Background(), plan, state, cfg)
+		if diags.HasError() {
+			t.Fatal(diags)
+		}
+		dep := patch["deployment"].(map[string]interface{})
+		v, ok := dep["annotation"]
+		if !ok || v != nil {
+			t.Fatalf("configured empty annotation must resend JSON null: %v", dep)
+		}
+	})
+
 	t.Run("explicit clear wins over resend", func(t *testing.T) {
 		plan, state, cfg := newModels(types.StringNull(), strVal("old"), strVal(""))
 		patch, _, diags := diffSource(context.Background(), plan, state, cfg)

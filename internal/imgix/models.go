@@ -141,10 +141,21 @@ func (c *Client) FindSourceBySubdomains(ctx context.Context, subs []string) (*So
 }
 
 // CreateSource creates (and deploys) a source. attrs is encoded verbatim
-// under data.attributes. To avoid duplicates after ambiguous failures
-// (transport error or 5xx after the server committed), a failed create is
-// recovered by looking up a source with the same imgix_subdomains.
+// under data.attributes. A preflight lookup proves the subdomains are free
+// before POSTing (fast conflict error naming the owner); after an ambiguous
+// failure (transport error or 5xx, where the POST may have committed) the
+// recovery lookup only accepts a source that appeared after that preflight
+// and also matches the requested name, so a pre-existing source can never be
+// adopted by accident.
 func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{}) (*Source, error) {
+	if existing := c.lookupByAttrs(ctx, attrs, false); existing != nil {
+		return nil, &Error{
+			Status: 409,
+			Title:  "Conflict",
+			Detail: fmt.Sprintf("imgix_subdomains already belong to existing source %s (import it with `tofu import` instead of recreating)", existing.ID),
+		}
+	}
+
 	raw, err := c.do(ctx, "POST", "/sources", nil, map[string]interface{}{
 		"data": map[string]interface{}{"type": "sources", "attributes": attrs},
 	}, false)
@@ -155,7 +166,8 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 	var apiErr *Error
 	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 && apiErr.Status != 429 {
 		// Validation/conflict errors are final. Point at the conflicting
-		// source when one owns the requested subdomains.
+		// source when one owns the requested subdomains (e.g. it appeared
+		// between the preflight and the POST).
 		if apiErr.Status == 400 {
 			if found := c.lookupByAttrs(ctx, attrs, false); found != nil {
 				apiErr.Detail = fmt.Sprintf("%s (conflicting source ID: %s)", apiErr.Detail, found.ID)
@@ -164,9 +176,8 @@ func (c *Client) CreateSource(ctx context.Context, attrs map[string]interface{})
 		return nil, err
 	}
 
-	// Ambiguous failure: the source may exist. Recover by subdomain set and
-	// name — a pre-existing source with the same subdomains but a different
-	// name is not ours and must not be adopted by accident.
+	// Ambiguous failure and the source was proven absent before the POST:
+	// a now-matching source (subdomain set + name) is this create's result.
 	if found := c.lookupByAttrs(ctx, attrs, true); found != nil {
 		return found, nil
 	}

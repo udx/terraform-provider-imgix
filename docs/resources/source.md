@@ -52,7 +52,7 @@ resource "imgix_source" "media" {
 - `deployment_status` (String) API deployment status: deploying, deployed, disabled, or deleted.
 - `domains` (Set of String) Full delivery hostnames: imgix subdomains plus custom domains. No scheme.
 - `id` (String) Imgix source ID.
-- `secure_url_token` (String, Sensitive) Signing token for secured sources. Only present when secure_url_enabled is true.
+- `secure_url_token` (String, Sensitive) Signing token for the source when the API returns one; it may be present even when secure_url_enabled is false.
 
 <a id="nestedatt--deployment"></a>
 ### Nested Schema for `deployment`
