@@ -459,3 +459,67 @@ resource "imgix_source" "test" {
 
 	w.expectDestroyFails(sourceID)
 }
+
+// A config claiming a subdomain that belongs to an existing source must fail
+// at create with the conflict error naming the owner, and must leave the
+// existing source byte-identical. This is the "cannot clobber real sources"
+// guarantee, exercised against a live production source.
+func TestAccSourceConflictNeverMutatesExisting(t *testing.T) {
+	testAccPreCheck(t)
+	client := imgix.NewClient(os.Getenv("IMGIX_API_KEY"))
+	ctx := context.Background()
+
+	// Any deployed source we do not own; read-only.
+	existing, err := client.FindSourceBySubdomains(ctx, []string{"media-icamiami-org"})
+	if err != nil || existing == nil {
+		t.Fatalf("probe source unavailable: %v", err)
+	}
+	before, err := client.GetSourceAttributes(ctx, existing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := fmt.Sprintf(`
+terraform {
+  required_providers {
+    imgix = {
+      source = "udx/imgix"
+    }
+  }
+}
+
+provider "imgix" {}
+
+resource "imgix_source" "test" {
+  name = "TF conflict probe (must fail)"
+
+  deployment = {
+    type             = "gcs"
+    imgix_subdomains = ["media-icamiami-org"]
+    gcs_bucket       = %[1]q
+    gcs_access_key   = %[2]q
+    gcs_secret_key   = %[3]q
+  }
+}
+`, os.Getenv("IMGIX_TEST_GCS_BUCKET"),
+		os.Getenv("IMGIX_TEST_GCS_ACCESS_KEY"), os.Getenv("IMGIX_TEST_GCS_SECRET_KEY"))
+
+	w := newTFWorkdir(t, config)
+	out, applyErr := w.run("apply", "-no-color", "-auto-approve", "-input=false")
+	if applyErr == nil {
+		t.Fatalf("create with a taken subdomain unexpectedly succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, existing.ID) {
+		t.Fatalf("conflict error must name the owning source ID %s:\n%s", existing.ID, out)
+	}
+
+	after, err := client.GetSourceAttributes(ctx, existing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeJSON, _ := json.Marshal(before)
+	afterJSON, _ := json.Marshal(after)
+	if string(beforeJSON) != string(afterJSON) {
+		t.Fatalf("existing source was mutated!\nbefore: %s\nafter:  %s", beforeJSON, afterJSON)
+	}
+}
