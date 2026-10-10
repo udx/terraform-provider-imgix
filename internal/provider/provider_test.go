@@ -182,6 +182,10 @@ func (w *tfWorkdir) expectDestroyFails(sourceID string) {
 }
 
 func testAccConfig(subdomain, name, params string, withSecrets bool) string {
+	if !strings.HasPrefix(subdomain, "tf-acc-") {
+		// Never let a test touch anything but disposable sources.
+		panic(fmt.Sprintf("test subdomain %q must start with tf-acc-", subdomain))
+	}
 	secrets := ""
 	if withSecrets {
 		secrets = fmt.Sprintf(`

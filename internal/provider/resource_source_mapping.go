@@ -102,6 +102,12 @@ func diffSource(ctx context.Context, plan, state *SourceResourceModel) (map[stri
 	}
 
 	if len(depPatch) > 0 {
+		// Any deployment PATCH that omits annotation makes the API regenerate
+		// it ("New deployment created for source by <user>"). Resend the
+		// configured value so unrelated updates don't churn it.
+		if _, patched := depPatch["annotation"]; !patched && !sd.Annotation.IsNull() && sd.Annotation.ValueString() != "" {
+			depPatch["annotation"] = sd.Annotation.ValueString()
+		}
 		patch["deployment"] = depPatch
 	}
 	return patch, len(depPatch) > 0, diags
@@ -148,7 +154,12 @@ func flattenSource(ctx context.Context, src *imgix.Source, model *SourceResource
 		d.GCSPrefix = stringPointerValue(dep.GCSPrefix)
 		d.ImageError = stringPointerValue(dep.ImageError)
 		d.ImageMissing = stringPointerValue(dep.ImageMissing)
-		d.Annotation = stringPointerValue(dep.Annotation)
+		// Annotation is write-only after creation: any deployment PATCH that
+		// omits it makes the API regenerate it, so the configured/state value
+		// is kept. Only seed from the API when the value is unknown (import).
+		if d.Annotation.IsUnknown() {
+			d.Annotation = stringPointerValue(dep.Annotation)
+		}
 
 		subdomains = dep.ImgixSubdomains
 		subValue, subDiags := types.SetValueFrom(ctx, types.StringType, dep.ImgixSubdomains)
